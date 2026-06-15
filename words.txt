@@ -1,0 +1,14 @@
+视觉错误###wrong_visual：
+听觉错误###wrong_audio：
+时间错误###wrong_timestamp：
+顺序错误###wrong_order：
+额外信息###unsupported_inference：
+匹配错位###option_mismatch：
+步骤缺失###missing_key_step：
+逻辑冲突###contradiction：
+其他###other：
+选项缺失###No option matches：
+题目异常###PASS：
+多选错误###Multiple options are correct：
+视频异常###PASS：The video cannot be played
+理由错误###Reasoning error：
