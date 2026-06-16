@@ -22,6 +22,13 @@ def get_root_path():
     else:
         return Path(__file__).resolve().parents[1]
 
+def is_translation_error(t: str) -> bool:
+    t_strip = t.strip()
+    # 只有当翻译结果以中括号包裹，且含有 Error/Exception/未配置/失败/故障 等特定标记时，才断定为引擎异常
+    if t_strip.startswith("[") and t_strip.endswith("]"):
+        if any(indicator in t_strip for indicator in ["Error", "Exception", "未配置", "失败", "故障", "未就绪"]):
+            return True
+    return False
 
 class OfflineTranslator:
     """
@@ -142,7 +149,7 @@ class OfflineTranslator:
 
     def translate(self, text, from_code: str = "en", to_code: str = "zh", force_engine: str = None):
         """
-        核心翻译接口。修复了 force_engine 参数缺失的问题，完美支持动态强制路由。
+        核心翻译接口。已进行 Ollama 批量高吞吐合并翻译重构与超时优化。
         """
         is_list = isinstance(text, list)
         original_texts = text if is_list else [text]
@@ -158,20 +165,30 @@ class OfflineTranslator:
             return [""] * len(original_texts) if is_list else ""
             
         results = [""] * len(original_texts)
-
-        # 判断最终使用的引擎：如果有强制指定，则使用指定的；否则使用自动探测到的
         active_engine = force_engine if force_engine else self.engine_type
 
         # 模式 A：本地运行的 Ollama (GGUF) 大语言模型翻译
         if active_engine == "ollama" or (active_engine is None and self.use_ollama):
             try:
+                # 【核心优化】：如果传入的是多行列表，优先使用整块 JSON 批量翻译，速度极大提升且更具上下文一致性
+                if is_list and len(valid_texts) > 1:
+                    try:
+                        batch_results = self._translate_batch_via_ollama(valid_texts, from_code, to_code)
+                        for idx, trans_t in zip(valid_indices, batch_results):
+                            results[idx] = trans_t
+                        return results
+                    except Exception as e_batch:
+                        print(f"[Ollama Batch Error] Fallback to line-by-line: {e_batch}")
+                        # 批量出错时无感退避至逐行翻译，确保万无一失
+                
+                # 逐行翻译（单行翻译超时从 5 秒放宽至 12 秒，防偶发假死）
                 for idx, t in zip(valid_indices, valid_texts):
                     results[idx] = self._translate_via_ollama(t, from_code, to_code)
                 return results if is_list else results[0]
             except Exception as e_ollama:
-                print(f"[Ollama Error] Fallback to local translation: {e_ollama}")
+                print(f"[Ollama Error] Fallback to local NMT: {e_ollama}")
                 self.use_ollama = False
-                active_engine = self.engine_type # Ollama崩溃则退避回传统模型
+                active_engine = self.engine_type
 
         # 模式 B：Argos 离线翻译
         if active_engine == "argos":
@@ -188,13 +205,12 @@ class OfflineTranslator:
         elif active_engine == "transformers":
             try:
                 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
-                
                 if self.model is None or self.tokenizer is None:
                     local_model_dir = self.models_dir / f"opus-mt-{from_code}-{to_code}"
                     if local_model_dir.exists() and local_model_dir.is_dir():
                         path_str = str(local_model_dir.resolve())
                         if sys.platform == "win32" and any(ord(c) > 127 for c in path_str):
-                            raise RuntimeError("Windows 环境下 SentencePiece 库无法读取带中文字符的路径。")
+                            raise RuntimeError("Windows 路径包含中文字符。")
                         self.tokenizer = AutoTokenizer.from_pretrained(path_str)
                         self.model = AutoModelForSeq2SeqLM.from_pretrained(path_str)
                     else:
@@ -205,12 +221,9 @@ class OfflineTranslator:
                 inputs = self.tokenizer(valid_texts, return_tensors="pt", padding=True, truncation=True, max_length=512)
                 translated = self.model.generate(**inputs, max_new_tokens=512)
                 decoded = self.tokenizer.batch_decode(translated, skip_special_tokens=True)
-                
                 for idx, decoded_text in zip(valid_indices, decoded):
                     results[idx] = decoded_text
-                    
                 return results if is_list else results[0]
-                
             except Exception as e:
                 err_msg = f"[Transformers Error: {e}]"
                 return [err_msg] * len(original_texts) if is_list else err_msg
@@ -219,39 +232,78 @@ class OfflineTranslator:
         return [err_msg] * len(original_texts) if is_list else err_msg
 
     def _translate_via_ollama(self, text: str, from_code: str, to_code: str) -> str:
+        """
+        单句翻译保持原有逻辑，但增加连接超时容错。
+        """
         url = "http://localhost:11434/api/generate"
         lang_name = "Chinese" if to_code == "zh" else "English"
         prompt = (
             f"### Role:\n"
             f"You are a professional video translator translator from {from_code} to {lang_name}.\n\n"
             f"### Strict Translation Rules:\n"
-            f"1. KEEP all proper nouns, personal names, and character names in their original English form. (e.g. 'Bruce', 'Nemo', 'Willem Dafoe' MUST remain unchanged as 'Bruce', 'Nemo', 'Willem Dafoe').\n"
-            f"2. KEEP all step IDs, serial numbers, and indexes exactly in their original format. (e.g. 'step_1', 'event_02', 'A.', '1.' must not be altered).\n"
+            f"1. KEEP all proper nouns, personal names, and character names in their original English form.\n"
+            f"2. KEEP all step IDs, serial numbers, and indexes exactly in their original format.\n"
             f"3. Translate the description and context into extremely natural, native {lang_name}.\n"
             f"4. Output ONLY the translated text. Do not provide any explanation, quotes, or notes.\n\n"
-            f"### Few-Shot Demonstration:\n"
-            f"Input: \"F.Bruce picks up the pleated strip after event_02.\"\n"
-            f"Output: \"F.Bruce 在 event_02 之后拾起了褶边条。\"\n\n"
             f"### Actual Task Input:\n"
             f"Input: \"{text}\"\n"
             f"Output: "
         )
-        
-        data = {
-            "model": "qwen2.5:3b", 
-            "prompt": prompt,
-            "stream": False
-        }
+        data = {"model": "qwen2.5:3b", "prompt": prompt, "stream": False}
         encoded_data = json.dumps(data).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=encoded_data,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=5) as response:
+        req = urllib.request.Request(url, data=encoded_data, headers={"Content-Type": "application/json"}, method="POST")
+        # 超时放宽至 12 秒，保障首次冷启动加载模型时不会超时崩溃
+        with urllib.request.urlopen(req, timeout=12) as response:
             res = json.loads(response.read().decode("utf-8"))
             return res.get("response", "").strip()
+
+    def _translate_batch_via_ollama(self, texts: list[str], from_code: str, to_code: str) -> list[str]:
+        """
+        【新增】：整框批量翻译函数。使用 JSON 格式化机制，一次交互获得所有结果，彻底消除频繁连接延时。
+        """
+        url = "http://localhost:11434/api/generate"
+        lang_name = "Chinese" if to_code == "zh" else "English"
+        
+        # 将原文本打包成 JSON 传给大模型，防止换行和特殊标点切分失败
+        input_json = json.dumps(texts, ensure_ascii=False)
+        prompt = (
+            f"### Role:\n"
+            f"You are a professional video translator translator from {from_code} to {lang_name}.\n\n"
+            f"### Strict Translation Rules:\n"
+            f"1. KEEP all proper nouns, personal names, and character names in their original English form (e.g., 'Kent', 'Andre' MUST remain unchanged).\n"
+            f"2. KEEP all step IDs, serial numbers, and indexes exactly in their original format.\n"
+            f"3. Translate the description into extremely natural, native {lang_name}.\n"
+            f"4. You will be given a JSON array of strings. You MUST return a JSON array of the exact same length containing only the translated strings in order.\n"
+            f"5. Output ONLY the raw valid JSON array. Do not provide any markdown, explain, quotes, or notes.\n\n"
+            f"### Input JSON Array:\n"
+            f"{input_json}\n\n"
+            f"### Output JSON Array:\n"
+        )
+        data = {
+            "model": "qwen2.5:3b", 
+            "prompt": prompt, 
+            "stream": False,
+            "format": "json"  # 强制大模型输出合法的 JSON 格式，方便解析
+        }
+        encoded_data = json.dumps(data).encode("utf-8")
+        req = urllib.request.Request(url, data=encoded_data, headers={"Content-Type": "application/json"}, method="POST")
+        # 批量整包翻译超时放宽至 25 秒
+        with urllib.request.urlopen(req, timeout=25) as response:
+            res = json.loads(response.read().decode("utf-8"))
+            response_text = res.get("response", "").strip()
+            
+            # 清洗可能带有的 markdown code 标记（防范部分未对齐模型返回 ```json ）
+            clean_text = response_text
+            if clean_text.startswith("```"):
+                clean_text = re.sub(r'^```(?:json)?\s*', '', clean_text)
+                clean_text = re.sub(r'\s*```$', '', clean_text)
+            clean_text = clean_text.strip()
+            
+            translated_list = json.loads(clean_text)
+            if isinstance(translated_list, list) and len(translated_list) == len(texts):
+                return [str(item).strip() for item in translated_list]
+            else:
+                raise ValueError("Ollama 批量翻译响应列表长度不一致")
 
 
 import logging
@@ -343,8 +395,10 @@ class VideoTimelineParseRule(BaseRule):
                     self.offline_translator = OfflineTranslator()
                 try:
                     res_list = self.offline_translator.translate(raw_texts_to_translate, "en", "zh", force_engine=force_model)
-                    if isinstance(res_list, list) and any("未就绪" in t or "待装载" in t or "异常" in t for t in res_list):
-                        return None, res_list[0]
+                    # 使用严格错误断言器
+                    if isinstance(res_list, list) and any(is_translation_error(t) for t in res_list):
+                        err_item = next((t for t in res_list if is_translation_error(t)), "未知离线异常")
+                        return None, err_item
                     return res_list, None
                 except Exception as e:
                     return None, str(e)
@@ -424,8 +478,10 @@ class ActualTranslationRule(BaseRule):
                 paragraphs = [p.strip() for p in raw_text.split('\n') if p.strip()]
                 if not paragraphs: return "", None
                 res_list = self.offline_translator.translate(paragraphs, from_code=from_lang[:2], to_code=to_lang[:2], force_engine=force_model)
-                if isinstance(res_list, list) and any("未就绪" in t or "待装载" in t or "异常" in t for t in res_list):
-                    return None, res_list[0]
+                # 使用严格错误断言器
+                if isinstance(res_list, list) and any(is_translation_error(t) for t in res_list):
+                    err_item = next((t for t in res_list if is_translation_error(t)), "未知离线异常")
+                    return None, err_item
                 return "\n".join(res_list) if isinstance(res_list, list) else str(res_list), None
             except Exception as e:
                 return None, str(e)

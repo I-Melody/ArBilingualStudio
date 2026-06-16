@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # 文件路径：main.py
 
+import logging
 from utils.hot_reload import HotReloadManager
 from engine.rule_engine import RuleEngine
 from PyQt6.QtCore import Qt, QPoint, QRect, QSettings, QDate
@@ -34,6 +35,8 @@ def _pyinstaller_ghost_hook():
     import PyQt6.QtPdfWidgets
     import PyQt6.QtMultimedia
     import PyQt6.QtMultimediaWidgets
+    import PyQt6.QtWebEngineWidgets
+    import PyQt6.QtWebEngineCore
     import hashlib
     import urllib.request
     import urllib.parse
@@ -55,24 +58,27 @@ def get_base_path():
     else:
         return Path(__file__).resolve().parent
 
+
 BASE_PATH = get_base_path()
 
 if str(BASE_PATH) not in sys.path:
     sys.path.insert(0, str(BASE_PATH))
 
 # 挂载全局级日志监听，所有大大小小的报错/崩溃都会被写入根目录的 error_record.log
-import logging
 log_file = BASE_PATH / "error_record.log"
 logging.basicConfig(
-    filename=str(log_file), 
-    level=logging.WARNING, # 记录警告及以上级别
-    format='%(asctime)s [%(levelname)s] %(message)s', 
+    filename=str(log_file),
+    level=logging.WARNING,  # 记录警告及以上级别
+    format='%(asctime)s [%(levelname)s] %(message)s',
     encoding='utf-8'
 )
 
+
 def global_exception_handler(exc_type, exc_value, exc_traceback):
-    logging.error("系统发生未捕获的致命异常", exc_info=(exc_type, exc_value, exc_traceback))
+    logging.error("系统发生未捕获的致命异常", exc_info=(
+        exc_type, exc_value, exc_traceback))
     sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
 
 sys.excepthook = global_exception_handler
 # =========================================================================
@@ -221,8 +227,8 @@ class MainWindow(QMainWindow):
         menus_dir = BASE_PATH / "menus"
         menu_files = sorted(menus_dir.glob("menu*.py"))
         for file in menu_files:
-            if file.stem == "menu2":
-                continue
+            # if file.stem == "menu2":
+            #     continue
             self.load_tab_module(file.stem)
 
     def load_tab_module(self, module_name: str):

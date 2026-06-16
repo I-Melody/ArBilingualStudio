@@ -576,10 +576,9 @@ class MenuWidget(BaseMenuWidget):
 
         self.update_engine_combobox_labels()
 
-    # ========================== 核心业务与对焦委托函数 ==========================
     def update_engine_combobox_labels(self):
         """
-        重构路由选择项为：在线优先、本地优先、以及若干本地物理单选
+        重构路由选择项。当本地 Ollama 就绪时，自动将其置为默认启动首选项。
         """
         routing_items = [
             "☁️ 在线优先 (自动降级)",
@@ -605,11 +604,23 @@ class MenuWidget(BaseMenuWidget):
 
         self.combo_mode_upper.clear()
         self.combo_mode_upper.addItems(all_items)
-        self.combo_mode_upper.setCurrentIndex(0) # 默认在线优先
 
         self.combo_mode_lower.clear()
         self.combo_mode_lower.addItems(all_items)
-        self.combo_mode_lower.setCurrentIndex(0) # 默认在线优先
+
+        # 【优化】：若 Ollama 模型存在，则自动将其选中，免去用户每次手动切换
+        ollama_text = "🤖 Ollama Qwen (本地LLM)"
+        idx_upper = self.combo_mode_upper.findText(ollama_text)
+        if idx_upper != -1:
+            self.combo_mode_upper.setCurrentIndex(idx_upper)
+        else:
+            self.combo_mode_upper.setCurrentIndex(0)
+
+        idx_lower = self.combo_mode_lower.findText(ollama_text)
+        if idx_lower != -1:
+            self.combo_mode_lower.setCurrentIndex(idx_lower)
+        else:
+            self.combo_mode_lower.setCurrentIndex(0)
 
     def get_selected_engine_key(self, combobox: QComboBox) -> str:
         text = combobox.currentText()
