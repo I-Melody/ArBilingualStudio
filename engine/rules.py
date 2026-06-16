@@ -249,7 +249,14 @@ class OfflineTranslator:
             f"Input: \"{text}\"\n"
             f"Output: "
         )
-        data = {"model": "qwen2.5:3b", "prompt": prompt, "stream": False}
+        data = {
+            "model": "translategemma:4b",  # <--- 将模型名称改为新下载的模型
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.1  # 保持 0.1 低温，让其严谨翻译
+            }
+        }
         encoded_data = json.dumps(data).encode("utf-8")
         req = urllib.request.Request(url, data=encoded_data, headers={"Content-Type": "application/json"}, method="POST")
         # 超时放宽至 12 秒，保障首次冷启动加载模型时不会超时崩溃
@@ -280,10 +287,12 @@ class OfflineTranslator:
             f"### Output JSON Array:\n"
         )
         data = {
-            "model": "qwen2.5:3b", 
-            "prompt": prompt, 
+            "model": "translategemma:4b",  # <--- 将模型名称改为新下载的模型
+            "prompt": prompt,
             "stream": False,
-            "format": "json"  # 强制大模型输出合法的 JSON 格式，方便解析
+            "options": {
+                "temperature": 0.1  # 保持 0.1 低温，让其严谨翻译
+            }
         }
         encoded_data = json.dumps(data).encode("utf-8")
         req = urllib.request.Request(url, data=encoded_data, headers={"Content-Type": "application/json"}, method="POST")
