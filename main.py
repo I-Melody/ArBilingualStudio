@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
 )
 import sys
 import os
+os.environ['QT_MULTIMEDIA_PREFERRED_PLUGINS'] = 'windowsmediafoundation'
 import importlib
 from pathlib import Path
 

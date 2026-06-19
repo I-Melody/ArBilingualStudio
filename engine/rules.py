@@ -282,7 +282,7 @@ class OfflineTranslator:
 
     def _translate_batch_via_ollama(self, texts: list[str], from_code: str, to_code: str) -> list[str]:
         """
-        整框批量翻译函数。使用 JSON 格式化机制，修正了 model 绑定和动态 Temp。
+        整框批量翻译函数。已移除 API Payload 中的 "format" 瓶颈属性，大幅提升生成速率。
         """
         url = "http://localhost:11434/api/generate"
         lang_name = "Chinese" if to_code == "zh" else "English"
@@ -301,7 +301,8 @@ class OfflineTranslator:
             f"{input_json}\n\n"
             f"### Output JSON Array:\n"
         )
-        # 修正 "self.ollama_model" 字面量 Bug 并引入动态温度
+        
+        # 【核心性能修复】：不传递 "format": "json"，从而绕过 Ollama 的 GBNF 词表校验引擎，速度暴增！
         data = {
             "model": self.ollama_model,  
             "prompt": prompt,

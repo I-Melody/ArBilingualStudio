@@ -18,6 +18,18 @@ try:
 except ImportError:
     MULTIMEDIA_SUPPORTED = False
 
+def get_root_path():
+    """
+    自适应获取物理根目录。
+    * 完美解决打包后由于临时目录释放导致的寻址错误和视频下载缓存失败
+    """
+    import sys
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    else:
+        return Path(__file__).resolve().parents[1]
+
+
 class FocusFrame(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -265,7 +277,7 @@ class ModelDetectWorker(QThread):
                     offline_items.append("🤖 Ollama (本地大模型)")
         except: pass
 
-        models_dir = Path(__file__).parents[1] / "models"
+        models_dir = get_root_path() / "models"
         if (models_dir / "opus-mt-en-zh").exists():
             offline_items.append("📦 MarianMT (本地小模型)")
         if len(list(models_dir.glob("translate-en_zh-*.argosmodel"))) > 0:
@@ -662,7 +674,7 @@ class MenuWidget(BaseMenuWidget):
         self.btn_abort_lower.setEnabled(False)
 
     def load_words_config(self):
-        words_path = Path(__file__).parents[1] / "words.txt"
+        words_path = get_root_path() / "words.txt"
         phrases = []
         if words_path.exists():
             try:
@@ -924,7 +936,7 @@ class MenuWidget(BaseMenuWidget):
         QApplication.processEvents()
 
         # 3. 执行物理文件清理
-        cache_dir = Path(__file__).parents[1] / "cache"
+        cache_dir = get_root_path() / "cache"
         deleted_count = 0
         failed_count = 0
         if cache_dir.exists():
@@ -997,7 +1009,7 @@ class MenuWidget(BaseMenuWidget):
                 possible_ext = "." + last_part.split(".")[-1]
                 if len(possible_ext) <= 5 and possible_ext.isalnum(): ext = possible_ext
 
-        cache_dir = Path(__file__).parents[1] / "cache"
+        cache_dir = get_root_path() / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         local_cache_path = cache_dir / f"{url_hash}{ext}"
 
@@ -1147,7 +1159,7 @@ class MenuWidget(BaseMenuWidget):
         c_text = html.escape(item['content'])
         b_text = html.escape(item['bridge'])
         
-        hl_path = Path(__file__).parents[1] / "highlight.txt"
+        hl_path = get_root_path() / "highlight.txt"
         if hl_path.exists():
             try:
                 with open(hl_path, "r", encoding="utf-8") as f:
