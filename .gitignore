@@ -3,4 +3,5 @@
 /build/
 /venv/
 /models/
+/cache/
 __pycache__/
