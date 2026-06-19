@@ -210,8 +210,11 @@ class MenuWidget(BaseMenuWidget):
     def _exec_ollama_scan(self):
         models_found = []
         try:
-            req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
-            with urllib.request.urlopen(req, timeout=1.0) as response:
+            # 同样隔离系统代理，防止配置规则页时引发下载锁死
+            proxy_handler = urllib.request.ProxyHandler({})
+            opener = urllib.request.build_opener(proxy_handler)
+            req = urllib.request.Request("http://localhost:11434/api/tags")
+            with opener.open(req, timeout=1.0) as response:
                 if response.status == 200:
                     data = json.loads(response.read().decode("utf-8"))
                     models = data.get("models", [])
@@ -226,7 +229,6 @@ class MenuWidget(BaseMenuWidget):
         self.combo_ollama_model.clear()
         if models_found:
             self.combo_ollama_model.addItems(models_found)
-            # 还原用户选定的模型
             mw = self.window()
             if mw and hasattr(mw, "settings"):
                 saved_model = mw.settings.value("ollama_model", "")

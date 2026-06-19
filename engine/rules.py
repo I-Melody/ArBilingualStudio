@@ -30,6 +30,21 @@ def is_translation_error(t: str) -> bool:
             return True
     return False
 
+def make_local_request(url, data_dict=None, timeout=10):
+    """
+    【核心性能修复】：专门用于本地 Ollama 通信的无代理请求器。
+    彻底隔离系统代理（VPN/Clash）的干扰，消除注册表并发锁，保障零延迟、不丢包。
+    """
+    proxy_handler = urllib.request.ProxyHandler({})  # 强制无代理
+    opener = urllib.request.build_opener(proxy_handler)
+    req = urllib.request.Request(url)
+    if data_dict:
+        req.add_header("Content-Type", "application/json")
+        req.data = json.dumps(data_dict).encode("utf-8")
+        req.method = "POST"
+    with opener.open(req, timeout=timeout) as response:
+        return response.read().decode("utf-8")
+
 class OfflineTranslator:
     """
     本地离线神经网络翻译引擎。
@@ -74,17 +89,16 @@ class OfflineTranslator:
 
         # 1. 探测本地 Ollama 大模型服务
         try:
-            req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
-            with urllib.request.urlopen(req, timeout=0.5) as response:
-                if response.status == 200:
-                    data = json.loads(response.read().decode("utf-8"))
-                    models = data.get("models", [])
-                    if models:
-                        self.ollama_model = models[0].get("name", "translategemma:4b") # 动态抓取第一个可用模型
-                    self.use_ollama = True
-                    self.engine_type = "ollama"
+            res_data = make_local_request("http://localhost:11434/api/tags", timeout=1.0)
+            data = json.loads(res_data)
+            models = data.get("models", [])
+            if models:
+                self.ollama_model = models[0].get("name", "translategemma:4b")
+            self.use_ollama = True
+            self.engine_type = "ollama"
         except Exception:
             pass
+
 
         # 2. 传统物理模型扫描
         if not self.use_ollama:
@@ -274,11 +288,13 @@ class OfflineTranslator:
                 "temperature": getattr(self, "ollama_temp", 0.1)
             }
         }
-        encoded_data = json.dumps(data).encode("utf-8")
-        req = urllib.request.Request(url, data=encoded_data, headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=12) as response:
-            res = json.loads(response.read().decode("utf-8"))
+        try:
+            # 改用 make_local_request，彻底解决 VPN 开启时的偶发空译文
+            res_data = make_local_request(url, data_dict=data, timeout=12)
+            res = json.loads(res_data)
             return res.get("response", "").strip()
+        except Exception as e:
+            raise e
 
     def _translate_batch_via_ollama(self, texts: list[str], from_code: str, to_code: str) -> list[str]:
         """
@@ -311,10 +327,10 @@ class OfflineTranslator:
                 "temperature": getattr(self, "ollama_temp", 0.1)
             }
         }
-        encoded_data = json.dumps(data).encode("utf-8")
-        req = urllib.request.Request(url, data=encoded_data, headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=25) as response:
-            res = json.loads(response.read().decode("utf-8"))
+        try:
+            # 改用 make_local_request，彻底解决 VPN 开启时的偶发空译文
+            res_data = make_local_request(url, data_dict=data, timeout=25)
+            res = json.loads(res_data)
             response_text = res.get("response", "").strip()
             
             clean_text = response_text
@@ -328,6 +344,8 @@ class OfflineTranslator:
                 return [str(item).strip() for item in translated_list]
             else:
                 raise ValueError("Ollama 批量翻译响应列表长度不一致")
+        except Exception as e:
+            raise e
 
 
 import logging

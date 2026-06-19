@@ -271,8 +271,11 @@ class ModelDetectWorker(QThread):
     def run(self):
         offline_items = []
         try:
-            req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
-            with urllib.request.urlopen(req, timeout=1.0) as response:
+            # 【核心优化】：使用无代理 Opener 快速探测，保障视频高速下载通道不会因为代理冲突锁死在 0%
+            proxy_handler = urllib.request.ProxyHandler({})
+            opener = urllib.request.build_opener(proxy_handler)
+            req = urllib.request.Request("http://localhost:11434/api/tags")
+            with opener.open(req, timeout=1.0) as response:
                 if response.status == 200:
                     offline_items.append("🤖 Ollama (本地大模型)")
         except: pass
