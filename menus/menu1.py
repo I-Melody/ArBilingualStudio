@@ -253,6 +253,27 @@ class FormatWorker(QThread):
             self.finished.emit(result)
         except Exception as e: self.error.emit(str(e))
 
+class ModelDetectWorker(QThread):
+    finished_detect = pyqtSignal(list)
+    
+    def run(self):
+        offline_items = []
+        try:
+            req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
+            with urllib.request.urlopen(req, timeout=1.0) as response:
+                if response.status == 200:
+                    offline_items.append("🤖 Ollama (本地大模型)")
+        except: pass
+
+        models_dir = Path(__file__).parents[1] / "models"
+        if (models_dir / "opus-mt-en-zh").exists():
+            offline_items.append("📦 MarianMT (本地小模型)")
+        if len(list(models_dir.glob("translate-en_zh-*.argosmodel"))) > 0:
+            offline_items.append("📦 Argos NMT (本地轻量级)")
+
+        if offline_items:
+            self.finished_detect.emit(offline_items)
+
 class MenuWidget(BaseMenuWidget):
     def init_ui(self):
         # 极简样式表高度融合
@@ -578,49 +599,32 @@ class MenuWidget(BaseMenuWidget):
 
     def update_engine_combobox_labels(self):
         """
-        重构路由选择项。当本地 Ollama 就绪时，自动将其置为默认启动首选项。
+        异步后台路由项加载，采用 Qt 标准线程通信，消除冷启动卡顿与静默失败。
         """
         routing_items = [
             "☁️ 在线优先 (自动降级)",
             "💻 本地优先 (自动降级)"
         ]
-
-        offline_items = []
-        try:
-            req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
-            with urllib.request.urlopen(req, timeout=0.2) as response:
-                if response.status == 200:
-                    offline_items.append("🤖 Ollama Qwen (本地LLM)")
-        except: pass
-
-        root_path = Path(__file__).parents[1]
-        models_dir = root_path / "models"
-        if (models_dir / "opus-mt-en-zh").exists():
-            offline_items.append("📦 MarianMT (本地小模型)")
-        if len(list(models_dir.glob("translate-en_zh-*.argosmodel"))) > 0:
-            offline_items.append("📦 Argos NMT (本地轻量级)")
-
-        all_items = routing_items + offline_items
-
         self.combo_mode_upper.clear()
-        self.combo_mode_upper.addItems(all_items)
-
+        self.combo_mode_upper.addItems(routing_items)
         self.combo_mode_lower.clear()
-        self.combo_mode_lower.addItems(all_items)
+        self.combo_mode_lower.addItems(routing_items)
 
-        # 【优化】：若 Ollama 模型存在，则自动将其选中，免去用户每次手动切换
-        ollama_text = "🤖 Ollama Qwen (本地LLM)"
-        idx_upper = self.combo_mode_upper.findText(ollama_text)
-        if idx_upper != -1:
-            self.combo_mode_upper.setCurrentIndex(idx_upper)
-        else:
-            self.combo_mode_upper.setCurrentIndex(0)
+        # 启动合法 QThread 守护线程后台探测
+        self.detect_worker = ModelDetectWorker(self)
+        self.detect_worker.finished_detect.connect(self._apply_detected_models)
+        self.detect_worker.start()
 
-        idx_lower = self.combo_mode_lower.findText(ollama_text)
-        if idx_lower != -1:
-            self.combo_mode_lower.setCurrentIndex(idx_lower)
-        else:
-            self.combo_mode_lower.setCurrentIndex(0)
+    def _apply_detected_models(self, offline_items):
+        self.combo_mode_upper.addItems(offline_items)
+        self.combo_mode_lower.addItems(offline_items)
+        
+        ollama_text = "🤖 Ollama (本地大模型)"
+        idx = self.combo_mode_upper.findText(ollama_text)
+        if idx != -1:
+            self.combo_mode_upper.setCurrentIndex(idx)
+            self.combo_mode_lower.setCurrentIndex(idx)
+
 
     def get_selected_engine_key(self, combobox: QComboBox) -> str:
         text = combobox.currentText()
@@ -745,10 +749,22 @@ class MenuWidget(BaseMenuWidget):
         self.poll_timer.timeout.connect(self.poll_player_progress)
 
         self.player.playbackStateChanged.connect(self.on_playback_state_changed)
+        self.player.errorOccurred.connect(self.on_player_error)
         self.progress_slider.sliderPressed.connect(self.on_slider_pressed)
         self.progress_slider.sliderReleased.connect(self.on_slider_released)
         self.progress_slider.sliderMoved.connect(self.on_slider_moved)
         self.video_widget.installEventFilter(self)
+
+    def on_player_error(self, error, error_string):
+        if hasattr(self, "player") and self.player.source().isLocalFile():
+            local_path = self.player.source().toLocalFile()
+            mw = self.window()
+            if mw and hasattr(mw, "status_bar"):
+                mw.status_bar.showMessage(f"⚠️ 视频格式内嵌解码失败，正在尝试调起系统默认外置播放器...", 4000)
+            try:
+                import os
+                os.startfile(local_path)
+            except Exception: pass
 
     def on_playback_state_changed(self, state):
         if state == QMediaPlayer.PlaybackState.PlayingState:
@@ -844,15 +860,34 @@ class MenuWidget(BaseMenuWidget):
         raw_text = self.timestamp_input.text().strip()
         if not raw_text or not MULTIMEDIA_SUPPORTED: return
         try:
-            parts = raw_text.split(":")
-            if len(parts) == 1: total_seconds = float(parts[0])
-            elif len(parts) == 2: total_seconds = int(parts[0]) * 60 + float(parts[1])
-            elif len(parts) == 3: total_seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-            else: raise ValueError()
-            target_ms = int(total_seconds * 1000)
+            import re
+            parts = re.split(r'[:\.]', raw_text)
+            ms = 0
+
+            # 严格根据冒号/点号的切割数量来重置逻辑
+            if len(parts) == 3:
+                # 三段式：强制识别为 分:秒:毫秒 (例如 00:01:15 -> 0分 1秒 15毫秒)
+                total_seconds = int(parts[0]) * 60 + float(parts[1])
+                ms = int(parts[2])
+            elif len(parts) == 2:
+                # 两段式：分:秒
+                total_seconds = int(parts[0]) * 60 + float(parts[1])
+            elif len(parts) == 1:
+                # 一段式：总秒数
+                total_seconds = float(parts[0])
+            elif len(parts) == 4:
+                # 四段式：时:分:秒:毫秒
+                total_seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+                ms = int(parts[3])
+            else:
+                raise ValueError()
+            
+            target_ms = int(total_seconds * 1000) + ms
+            
             duration = self.player.duration()
             if target_ms < 0: target_ms = 0
             elif duration > 0 and target_ms > duration: target_ms = duration
+            
             self.player.setPosition(target_ms)
             self.progress_slider.setValue(target_ms)
             self.video_frame.setFocus()
@@ -1099,12 +1134,31 @@ class MenuWidget(BaseMenuWidget):
     def display_item_detail(self, index: int):
         """
         选中左下方条目时，在右侧渲染精美的富文本卡片。
-        时间轴 A 标签已被我们安装了 handle_anchor_clicked 监听跳转。
         """
+        # 【必须将索引判断与 item 提取放在函数的最开头！】
         if index < 0 or index >= len(self.processed_items):
             self.detail_display.clear()
             return
         item = self.processed_items[index]
+
+        import html
+        import re
+        
+        c_text = html.escape(item['content'])
+        b_text = html.escape(item['bridge'])
+        
+        hl_path = Path(__file__).parents[1] / "highlight.txt"
+        if hl_path.exists():
+            try:
+                with open(hl_path, "r", encoding="utf-8") as f:
+                    keywords = [line.strip() for line in f if line.strip()]
+                for kw in keywords:
+                    pattern = re.compile(rf'\b{re.escape(kw)}\b', re.IGNORECASE)
+                    repl = lambda m: f'<span style="background-color: #15803d; color: #ffffff; padding: 0 4px; border-radius: 4px; font-weight: bold;">{m.group(0)}</span>'
+                    c_text = pattern.sub(repl, c_text)
+                    b_text = pattern.sub(repl, b_text)
+            except Exception: pass
+            
         html_content = f"""
         <div style="line-height: 1.6; font-size: 13.5px; color: #e4e4e7; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
             <div style="border-bottom: 1px solid #27272a; padding-bottom: 4px; margin-bottom: 8px;">
@@ -1125,7 +1179,7 @@ class MenuWidget(BaseMenuWidget):
             </table>
             <div style="background-color: #121214; border: 1px solid #27272a; border-radius: 4px; padding: 10px; margin-bottom: 6px;">
                 <b style="color: #a1a1aa; font-size: 12.5px;">📝 原始描述 Content：</b>
-                <span style="color: #f4f4f5; display: block; margin-top: 4px;">{item['content']}</span>
+                <span style="color: #f4f4f5; display: block; margin-top: 4px;">{c_text}</span>
                 <div style="border-top: 1px dashed #27272a; margin-top: 8px; padding-top: 8px;">
                     <b style="color: #38bdf8; font-size: 11.5px;">🤖 翻译：</b>
                     <span style="color: #60a5fa; display: block; margin-top: 4px;">{item['content_local_zh']}</span>
@@ -1133,7 +1187,7 @@ class MenuWidget(BaseMenuWidget):
             </div>
             <div style="background-color: #121214; border: 1px solid #27272a; border-radius: 4px; padding: 10px;">
                 <b style="color: #a1a1aa; font-size: 12.5px;">🔗 逻辑关联与过渡 Bridge：</b>
-                <span style="color: #e4e4e7; font-style: italic; display: block; margin-top: 4px;">{item['bridge']}</span>
+                <span style="color: #e4e4e7; font-style: italic; display: block; margin-top: 4px;">{b_text}</span>
                 <div style="border-top: 1px dashed #27272a; margin-top: 8px; padding-top: 8px;">
                     <b style="color: #38bdf8; font-size: 11.5px;">🤖 翻译：</b>
                     <span style="color: #60a5fa; display: block; margin-top: 4px;">{item['bridge_local_zh']}</span>

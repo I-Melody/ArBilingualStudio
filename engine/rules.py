@@ -34,7 +34,7 @@ class OfflineTranslator:
     """
     本地离线神经网络翻译引擎。
     【2026 终极体验优化】：
-    1. 动态侦测本地 Ollama 大语言模型服务 (默认 Qwen2.5:3b/1.5b)，实现人类级别的离线大模型意译。
+    1. 动态侦测本地 Ollama 大语言模型服务 (默认 translategemma:4b/1.5b)，实现人类级别的离线大模型意译。
     2. 兼容 Argos 本地模型自适应加载与降级。
     """
     _instance = None
@@ -66,6 +66,7 @@ class OfflineTranslator:
         self.model = None
         self.tokenizer = None
         self.use_ollama = False  
+        self.ollama_model = "translategemma:4b" # 默认回退值
         
         self.root_path = get_root_path()
         self.models_dir = self.root_path / "models"
@@ -76,9 +77,12 @@ class OfflineTranslator:
             req = urllib.request.Request("http://localhost:11434/api/tags", method="GET")
             with urllib.request.urlopen(req, timeout=0.5) as response:
                 if response.status == 200:
+                    data = json.loads(response.read().decode("utf-8"))
+                    models = data.get("models", [])
+                    if models:
+                        self.ollama_model = models[0].get("name", "translategemma:4b") # 动态抓取第一个可用模型
                     self.use_ollama = True
                     self.engine_type = "ollama"
-                    print("[Offline Engine] [Info] Detected active local Ollama service. Upgrading to LLM offline translation!")
         except Exception:
             pass
 
@@ -151,6 +155,18 @@ class OfflineTranslator:
         """
         核心翻译接口。已进行 Ollama 批量高吞吐合并翻译重构与超时优化。
         """
+
+        from PyQt6.QtCore import QSettings
+        settings = QSettings("BilingualStudioOrg", "BilingualStudioApp")
+        saved_model = settings.value("ollama_model", "")
+        if saved_model and "未检测到" not in saved_model:
+            self.ollama_model = saved_model
+            
+        try:
+            self.ollama_temp = float(settings.value("ollama_temp", "0.1"))
+        except Exception:
+            self.ollama_temp = 0.1
+
         is_list = isinstance(text, list)
         original_texts = text if is_list else [text]
         
@@ -233,7 +249,7 @@ class OfflineTranslator:
 
     def _translate_via_ollama(self, text: str, from_code: str, to_code: str) -> str:
         """
-        单句翻译保持原有逻辑，但增加连接超时容错。
+        单句翻译保持原有逻辑，已修正 literal 变量 bug，并引入动态 Temp。
         """
         url = "http://localhost:11434/api/generate"
         lang_name = "Chinese" if to_code == "zh" else "English"
@@ -249,29 +265,28 @@ class OfflineTranslator:
             f"Input: \"{text}\"\n"
             f"Output: "
         )
+        # 修正 "self.ollama_model" 字面量 Bug 并引入动态温度
         data = {
-            "model": "translategemma:4b",  # <--- 将模型名称改为新下载的模型
+            "model": self.ollama_model,  
             "prompt": prompt,
             "stream": False,
             "options": {
-                "temperature": 0.1  # 保持 0.1 低温，让其严谨翻译
+                "temperature": getattr(self, "ollama_temp", 0.1)
             }
         }
         encoded_data = json.dumps(data).encode("utf-8")
         req = urllib.request.Request(url, data=encoded_data, headers={"Content-Type": "application/json"}, method="POST")
-        # 超时放宽至 12 秒，保障首次冷启动加载模型时不会超时崩溃
         with urllib.request.urlopen(req, timeout=12) as response:
             res = json.loads(response.read().decode("utf-8"))
             return res.get("response", "").strip()
 
     def _translate_batch_via_ollama(self, texts: list[str], from_code: str, to_code: str) -> list[str]:
         """
-        【新增】：整框批量翻译函数。使用 JSON 格式化机制，一次交互获得所有结果，彻底消除频繁连接延时。
+        整框批量翻译函数。使用 JSON 格式化机制，修正了 model 绑定和动态 Temp。
         """
         url = "http://localhost:11434/api/generate"
         lang_name = "Chinese" if to_code == "zh" else "English"
         
-        # 将原文本打包成 JSON 传给大模型，防止换行和特殊标点切分失败
         input_json = json.dumps(texts, ensure_ascii=False)
         prompt = (
             f"### Role:\n"
@@ -286,22 +301,21 @@ class OfflineTranslator:
             f"{input_json}\n\n"
             f"### Output JSON Array:\n"
         )
+        # 修正 "self.ollama_model" 字面量 Bug 并引入动态温度
         data = {
-            "model": "translategemma:4b",  # <--- 将模型名称改为新下载的模型
+            "model": self.ollama_model,  
             "prompt": prompt,
             "stream": False,
             "options": {
-                "temperature": 0.1  # 保持 0.1 低温，让其严谨翻译
+                "temperature": getattr(self, "ollama_temp", 0.1)
             }
         }
         encoded_data = json.dumps(data).encode("utf-8")
         req = urllib.request.Request(url, data=encoded_data, headers={"Content-Type": "application/json"}, method="POST")
-        # 批量整包翻译超时放宽至 25 秒
         with urllib.request.urlopen(req, timeout=25) as response:
             res = json.loads(response.read().decode("utf-8"))
             response_text = res.get("response", "").strip()
             
-            # 清洗可能带有的 markdown code 标记（防范部分未对齐模型返回 ```json ）
             clean_text = response_text
             if clean_text.startswith("```"):
                 clean_text = re.sub(r'^```(?:json)?\s*', '', clean_text)
@@ -371,10 +385,14 @@ class VideoTimelineParseRule(BaseRule):
                 raw_texts_to_translate.append(str(item.get("bridge", "")).strip())
 
             engine_mode = context.metadata.get("engine", "online_first")
+
+            # 定义极其罕见、不会被误翻的安全合并分隔符
+            BATCH_SEP = "\n\n[===||===]\n\n"
             
             # 定义两种基础翻译器的包装函数
             def try_online_batch():
                 online_engine = ActualTranslationRule()
+                # 过滤并记录原始有效索引
                 valid_indices, valid_texts = [], []
                 for idx, t in enumerate(raw_texts_to_translate):
                     if t.strip():
@@ -382,16 +400,19 @@ class VideoTimelineParseRule(BaseRule):
                         valid_texts.append(t.strip())
                 if not valid_texts: return [""] * len(raw_texts_to_translate), None
                 
-                prefixed_lines = [f"{i}. {line}" for i, line in enumerate(valid_texts)]
-                combined_text = "\n".join(prefixed_lines)
+                # 【优化1】：用分隔符将所有内容合并为一段超级长文，一次性提交！
+                combined_text = BATCH_SEP.join(valid_texts)
                 try:
                     translated_combined = online_engine._translate_with_fallback(combined_text, "en", "zh")
                     if "接口错误" in translated_combined or "429" in translated_combined:
                         return None, translated_combined
-                    translated_lines = [line.strip() for line in translated_combined.split("\n")]
-                    clean_translated_lines = [re.sub(r'^\d+\s*[\.\、\s]\s*', '', line) for line in translated_lines]
+                    
+                    # 按照分隔符切割还原
+                    clean_translated_lines = [line.strip() for line in translated_combined.split("[===||===]")]
+                    
                     if len(clean_translated_lines) != len(valid_texts):
-                        return None, "在线合并翻译对齐数目不一致"
+                        return None, f"在线合并翻译长度断层 (期望 {len(valid_texts)} 但返回 {len(clean_translated_lines)})"
+                        
                     translated_list = [""] * len(raw_texts_to_translate)
                     for v_idx, decoded_text in zip(valid_indices, clean_translated_lines):
                         translated_list[v_idx] = decoded_text
@@ -403,12 +424,34 @@ class VideoTimelineParseRule(BaseRule):
                 if self.offline_translator is None:
                     self.offline_translator = OfflineTranslator()
                 try:
-                    res_list = self.offline_translator.translate(raw_texts_to_translate, "en", "zh", force_engine=force_model)
-                    # 使用严格错误断言器
-                    if isinstance(res_list, list) and any(is_translation_error(t) for t in res_list):
-                        err_item = next((t for t in res_list if is_translation_error(t)), "未知离线异常")
-                        return None, err_item
-                    return res_list, None
+                    # 对于原生支持批量的 Ollama，直接传列表即可；对于其他，使用分隔符超级合并法
+                    engine_t = force_model if force_model else self.offline_translator.engine_type
+                    if engine_t == "ollama" or (engine_t is None and self.offline_translator.use_ollama):
+                        res_list = self.offline_translator.translate(raw_texts_to_translate, "en", "zh", force_engine=force_model)
+                        if isinstance(res_list, list) and any(is_translation_error(t) for t in res_list):
+                            return None, "Ollama离线异常"
+                        return res_list, None
+                    else:
+                        valid_indices, valid_texts = [], []
+                        for idx, t in enumerate(raw_texts_to_translate):
+                            if t.strip():
+                                valid_indices.append(idx)
+                                valid_texts.append(t.strip())
+                        if not valid_texts: return [""] * len(raw_texts_to_translate), None
+                        
+                        # 其他离线模型使用分隔符合并加速
+                        combined_text = BATCH_SEP.join(valid_texts)
+                        res_combined = self.offline_translator.translate(combined_text, "en", "zh", force_engine=force_model)
+                        if is_translation_error(res_combined): return None, res_combined
+                        
+                        clean_translated_lines = [line.strip() for line in res_combined.split("[===||===]")]
+                        if len(clean_translated_lines) != len(valid_texts):
+                            return None, "离线合并翻译对齐失效，分隔符丢失"
+                            
+                        translated_list = [""] * len(raw_texts_to_translate)
+                        for v_idx, decoded_text in zip(valid_indices, clean_translated_lines):
+                            translated_list[v_idx] = decoded_text
+                        return translated_list, None
                 except Exception as e:
                     return None, str(e)
 
