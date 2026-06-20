@@ -271,7 +271,7 @@ class ModelDetectWorker(QThread):
     def run(self):
         offline_items = []
         try:
-            # 【核心优化】：使用无代理 Opener 快速探测，保障视频高速下载通道不会因为代理冲突锁死在 0%
+            # 隔离代理快速探测 Ollama
             proxy_handler = urllib.request.ProxyHandler({})
             opener = urllib.request.build_opener(proxy_handler)
             req = urllib.request.Request("http://localhost:11434/api/tags")
@@ -281,9 +281,29 @@ class ModelDetectWorker(QThread):
         except: pass
 
         models_dir = get_root_path() / "models"
+        
+        # 【重要修复】：不仅检查 MarianMT 物理模型，还必须验证环境是否装有 transformers、torch 等依赖库
+        has_marian_libs = False
         if (models_dir / "opus-mt-en-zh").exists():
+            try:
+                import transformers
+                import torch
+                import sentencepiece
+                has_marian_libs = True
+            except ImportError:
+                pass
+        if has_marian_libs:
             offline_items.append("📦 MarianMT (本地小模型)")
+
+        # 【重要修复】：不仅检查 Argos 物理模型，还必须验证环境是否装有 argostranslate 依赖库
+        has_argos_libs = False
         if len(list(models_dir.glob("translate-en_zh-*.argosmodel"))) > 0:
+            try:
+                import argostranslate
+                has_argos_libs = True
+            except ImportError:
+                pass
+        if has_argos_libs:
             offline_items.append("📦 Argos NMT (本地轻量级)")
 
         if offline_items:

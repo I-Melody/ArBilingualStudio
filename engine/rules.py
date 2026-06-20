@@ -406,12 +406,12 @@ class VideoTimelineParseRule(BaseRule):
             engine_mode = context.metadata.get("engine", "online_first")
 
             # 定义极其罕见、不会被误翻的安全合并分隔符
-            BATCH_SEP = "\n\n[===||===]\n\n"
+            BATCH_SEP = '\n\n<span class="notranslate">###</span>\n\n'
+            SPLIT_PATTERN = r'<span class="notranslate">###</span>'
             
             # 定义两种基础翻译器的包装函数
             def try_online_batch():
                 online_engine = ActualTranslationRule()
-                # 过滤并记录原始有效索引
                 valid_indices, valid_texts = [], []
                 for idx, t in enumerate(raw_texts_to_translate):
                     if t.strip():
@@ -419,15 +419,15 @@ class VideoTimelineParseRule(BaseRule):
                         valid_texts.append(t.strip())
                 if not valid_texts: return [""] * len(raw_texts_to_translate), None
                 
-                # 【优化1】：用分隔符将所有内容合并为一段超级长文，一次性提交！
+                # 合并为一整段 HTML 安全长文，一次性提交
                 combined_text = BATCH_SEP.join(valid_texts)
                 try:
                     translated_combined = online_engine._translate_with_fallback(combined_text, "en", "zh")
                     if "接口错误" in translated_combined or "429" in translated_combined:
                         return None, translated_combined
                     
-                    # 按照分隔符切割还原
-                    clean_translated_lines = [line.strip() for line in translated_combined.split("[===||===]")]
+                    # 采用不区分大小写的正则进行切割还原，完美兼容各类在线引擎
+                    clean_translated_lines = [line.strip() for line in re.split(SPLIT_PATTERN, translated_combined, flags=re.IGNORECASE)]
                     
                     if len(clean_translated_lines) != len(valid_texts):
                         return None, f"在线合并翻译长度断层 (期望 {len(valid_texts)} 但返回 {len(clean_translated_lines)})"
@@ -443,7 +443,6 @@ class VideoTimelineParseRule(BaseRule):
                 if self.offline_translator is None:
                     self.offline_translator = OfflineTranslator()
                 try:
-                    # 对于原生支持批量的 Ollama，直接传列表即可；对于其他，使用分隔符超级合并法
                     engine_t = force_model if force_model else self.offline_translator.engine_type
                     if engine_t == "ollama" or (engine_t is None and self.offline_translator.use_ollama):
                         res_list = self.offline_translator.translate(raw_texts_to_translate, "en", "zh", force_engine=force_model)
@@ -458,14 +457,15 @@ class VideoTimelineParseRule(BaseRule):
                                 valid_texts.append(t.strip())
                         if not valid_texts: return [""] * len(raw_texts_to_translate), None
                         
-                        # 其他离线模型使用分隔符合并加速
+                        # 其他物理模型使用安全合并分隔符
                         combined_text = BATCH_SEP.join(valid_texts)
                         res_combined = self.offline_translator.translate(combined_text, "en", "zh", force_engine=force_model)
                         if is_translation_error(res_combined): return None, res_combined
                         
-                        clean_translated_lines = [line.strip() for line in res_combined.split("[===||===]")]
+                        # 正则切割还原
+                        clean_translated_lines = [line.strip() for line in re.split(SPLIT_PATTERN, res_combined, flags=re.IGNORECASE)]
                         if len(clean_translated_lines) != len(valid_texts):
-                            return None, "离线合并翻译对齐失效，分隔符丢失"
+                            return None, f"离线合并翻译对齐失效 (期望 {len(valid_texts)} 但返回 {len(clean_translated_lines)})"
                             
                         translated_list = [""] * len(raw_texts_to_translate)
                         for v_idx, decoded_text in zip(valid_indices, clean_translated_lines):
