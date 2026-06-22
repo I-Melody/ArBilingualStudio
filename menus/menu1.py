@@ -29,6 +29,88 @@ def get_root_path():
     else:
         return Path(__file__).resolve().parents[1]
 
+class ExternalVideoWindow(QWidget):
+    """
+    📺 独立物理外部视频播放视窗（高内聚设计：支持窗口永远置顶、焦点防丢失重定向与快捷键同步）
+    """
+    def __init__(self, player, main_menu):
+        super().__init__()
+        self.player = player
+        self.main_menu = main_menu
+        self.setWindowTitle("📺 视频独立播放视窗 (双屏/大图细节模式)")
+        self.resize(800, 600)
+        self.setStyleSheet("background-color: #000000;")
+        
+        # 允许键盘强对焦
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        
+        # 【优化1】：设置窗口永远保持在界面最上方（WindowStaysOnTopHint）
+        self.setWindowFlags(
+            Qt.WindowType.Window | 
+            Qt.WindowType.WindowStaysOnTopHint | 
+            Qt.WindowType.WindowMinMaxButtonsHint | 
+            Qt.WindowType.WindowCloseButtonHint
+        )
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.video_widget = QVideoWidget(self)
+        # 允许视频视窗强对焦，并安装事件过滤器
+        self.video_widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.video_widget.installEventFilter(self)
+        
+        layout.addWidget(self.video_widget)
+        
+        # 热迁移渲染目标
+        self.player.setVideoOutput(self.video_widget)
+        
+        # 启动后默认将焦点吸附到本窗口
+        self.setFocus()
+
+    def eventFilter(self, obj, event):
+        """
+        【优化2】：焦点防吞。用户点击外部视窗任何地方，焦点都会被重定向到本窗口本体，防止键盘快捷键失效
+        """
+        if obj == self.video_widget:
+            if event.type() == QEvent.Type.MouseButtonPress:
+                self.setFocus()
+                event.accept()
+                return True
+        return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event):
+        """
+        【优化3】：键盘透传。副窗口获得焦点时，键盘对视频的所有快捷操作无缝可用，高内聚复用 main_menu 的底层方法
+        """
+        if not MULTIMEDIA_SUPPORTED:
+            super().keyPressEvent(event)
+            return
+            
+        key = event.key()
+        if key == Qt.Key.Key_Space:
+            self.main_menu.toggle_playback()
+            event.accept()
+        elif key == Qt.Key.Key_Left:
+            self.main_menu.seek_offset(-5000)
+            event.accept()
+        elif key == Qt.Key.Key_Right:
+            self.main_menu.seek_offset(5000)
+            event.accept()
+        elif key == Qt.Key.Key_Up:
+            self.main_menu.adjust_volume_offset(5)
+            event.accept()
+        elif key == Qt.Key.Key_Down:
+            self.main_menu.adjust_volume_offset(-5)
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+        
+    def closeEvent(self, event):
+        # 窗口关闭时，归还渲染目标
+        self.main_menu.restore_video_to_embedded()
+        super().closeEvent(event)
+
 
 class FocusFrame(QFrame):
     def __init__(self, parent=None):
@@ -310,6 +392,46 @@ class ModelDetectWorker(QThread):
             self.finished_detect.emit(offline_items)
 
 class MenuWidget(BaseMenuWidget):
+    def open_external_video_window(self):
+        """
+        【新增】：热迁移渲染管线至独立的外部播放窗口，保留进度无缝播放
+        """
+        if not MULTIMEDIA_SUPPORTED or not hasattr(self, "player") or not self.player.source().isValid():
+            return
+            
+        pos = self.player.position()
+        self.player.pause()
+        
+        # 如果已经开着一个，先关闭
+        if hasattr(self, "popup_window") and self.popup_window:
+            self.popup_window.close()
+            
+        # 实例化热迁移独立视窗
+        self.popup_window = ExternalVideoWindow(self.player, self)
+        self.popup_window.show()
+        
+        # 原位置继续无缝唤醒播放
+        self.player.setPosition(pos)
+        self.player.play()
+        self.btn_play_pause.setText("⏸ 暂停")
+
+    def restore_video_to_embedded(self):
+        """
+        【新增】：热迁移渲染管线退避，重新归还至主界面内嵌组件中
+        """
+        if not MULTIMEDIA_SUPPORTED or not hasattr(self, "player"):
+            return
+            
+        pos = self.player.position()
+        self.player.pause()
+        
+        # 重新将已存在的视频输出流绑定给主界面的 QVideoWidget
+        self.player.setVideoOutput(self.video_widget)
+        self.player.setPosition(pos)
+        self.player.play()
+        self.btn_play_pause.setText("⏸ 暂停")
+        self.popup_window = None
+    
     def init_ui(self):
         # 极简样式表高度融合
         self.setStyleSheet("""
@@ -426,6 +548,15 @@ class MenuWidget(BaseMenuWidget):
         self.btn_play_pause.clicked.connect(self.toggle_playback)
         self.btn_play_pause.setEnabled(False)
         buttons_layout.addWidget(self.btn_play_pause)
+
+        self.btn_popup_play = QPushButton("🔲 窗口播放", self)
+        self.btn_popup_play.setObjectName("PlayerBtn")
+        self.btn_popup_play.setFixedWidth(85)
+        self.btn_popup_play.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_popup_play.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_popup_play.clicked.connect(self.open_external_video_window)
+        self.btn_popup_play.setEnabled(False)
+        buttons_layout.addWidget(self.btn_popup_play)
         
         buttons_layout.addStretch()
 
@@ -899,19 +1030,14 @@ class MenuWidget(BaseMenuWidget):
             parts = re.split(r'[:\.]', raw_text)
             ms = 0
 
-            # 严格根据冒号/点号的切割数量来重置逻辑
             if len(parts) == 3:
-                # 三段式：强制识别为 分:秒:毫秒 (例如 00:01:15 -> 0分 1秒 15毫秒)
                 total_seconds = int(parts[0]) * 60 + float(parts[1])
                 ms = int(parts[2])
             elif len(parts) == 2:
-                # 两段式：分:秒
                 total_seconds = int(parts[0]) * 60 + float(parts[1])
             elif len(parts) == 1:
-                # 一段式：总秒数
                 total_seconds = float(parts[0])
             elif len(parts) == 4:
-                # 四段式：时:分:秒:毫秒
                 total_seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
                 ms = int(parts[3])
             else:
@@ -925,6 +1051,11 @@ class MenuWidget(BaseMenuWidget):
             
             self.player.setPosition(target_ms)
             self.progress_slider.setValue(target_ms)
+            
+            # 【重要优化】：跳转时间戳后直接唤醒播放器并同步按钮状态
+            self.player.play()
+            self.btn_play_pause.setText("⏸ 暂停")
+            
             self.video_frame.setFocus()
             self.timestamp_input.clearFocus()
         except Exception:
@@ -975,6 +1106,7 @@ class MenuWidget(BaseMenuWidget):
 
         # 4. 重置 UI 状态
         self.btn_play_pause.setEnabled(False)
+        self.btn_popup_play.setEnabled(False)
         self.btn_play_pause.setText("▶ 播放")
         self.progress_slider.setValue(0)
         self.progress_slider.setEnabled(False)
@@ -1078,6 +1210,7 @@ class MenuWidget(BaseMenuWidget):
         try:
             self.player.setSource(QUrl.fromLocalFile(local_path_str))
             self.btn_play_pause.setEnabled(True)
+            self.btn_popup_play.setEnabled(True)
             self.btn_play_pause.setText("▶ 播放")
             self.progress_slider.setEnabled(True)
             self.timeline_ticks.set_duration(self.player.duration())
@@ -1104,6 +1237,8 @@ class MenuWidget(BaseMenuWidget):
         self.time_label.setText(f"{parse_ms_to_str(current_ms)} / {parse_ms_to_str(total_ms)}")
 
     def on_unload(self):
+        if hasattr(self, "popup_window") and self.popup_window:
+            self.popup_window.close()
         if MULTIMEDIA_SUPPORTED and hasattr(self, "player"):
             self.player.stop()
 

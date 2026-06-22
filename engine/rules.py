@@ -298,12 +298,17 @@ class OfflineTranslator:
 
     def _translate_batch_via_ollama(self, texts: list[str], from_code: str, to_code: str) -> list[str]:
         """
-        整框批量翻译函数。已移除 API Payload 中的 "format" 瓶颈属性，大幅提升生成速率。
+        【终极优化】：基于键值对锚点（Anchor）的自愈型批量翻译函数。
+        即使在 High Temp（创意温度 > 0）下，也能依靠强特征 Key 锁死翻译，并具备单行丢失自愈兜底，
+        彻底解决“响应列表长度不一致”报错，保障翻译速度与容错率达到极致。
         """
         url = "http://localhost:11434/api/generate"
         lang_name = "Chinese" if to_code == "zh" else "English"
         
-        input_json = json.dumps(texts, ensure_ascii=False)
+        # 1. 【核心重构】：将平面列表重构为刚性键值对字典（防漏译、防并译、防位置偏移）
+        input_dict = {f"k_{i}": t for i, t in enumerate(texts)}
+        input_json = json.dumps(input_dict, ensure_ascii=False)
+        
         prompt = (
             f"### Role:\n"
             f"You are a professional video translator translator from {from_code} to {lang_name}.\n\n"
@@ -311,14 +316,13 @@ class OfflineTranslator:
             f"1. KEEP all proper nouns, personal names, and character names in their original English form (e.g., 'Kent', 'Andre' MUST remain unchanged).\n"
             f"2. KEEP all step IDs, serial numbers, and indexes exactly in their original format.\n"
             f"3. Translate the description into extremely natural, native {lang_name}.\n"
-            f"4. You will be given a JSON array of strings. You MUST return a JSON array of the exact same length containing only the translated strings in order.\n"
-            f"5. Output ONLY the raw valid JSON array. Do not provide any markdown, explain, quotes, or notes.\n\n"
-            f"### Input JSON Array:\n"
+            f"4. You are given a JSON object where keys are IDs (e.g. \"k_0\", \"k_1\") and values are English texts.\n"
+            f"   You MUST translate each value and return a JSON object with the EXACT same keys.\n"
+            f"5. Output ONLY the raw valid JSON object. Do not provide any markdown, explain, quotes, or notes.\n\n"
+            f"### Input JSON Object:\n"
             f"{input_json}\n\n"
-            f"### Output JSON Array:\n"
+            f"### Output JSON Object:\n"
         )
-        
-        # 【核心性能修复】：不传递 "format": "json"，从而绕过 Ollama 的 GBNF 词表校验引擎，速度暴增！
         data = {
             "model": self.ollama_model,  
             "prompt": prompt,
@@ -327,8 +331,9 @@ class OfflineTranslator:
                 "temperature": getattr(self, "ollama_temp", 0.1)
             }
         }
+        
         try:
-            # 改用 make_local_request，彻底解决 VPN 开启时的偶发空译文
+            # 隔离代理快速本地通信
             res_data = make_local_request(url, data_dict=data, timeout=25)
             res = json.loads(res_data)
             response_text = res.get("response", "").strip()
@@ -339,11 +344,23 @@ class OfflineTranslator:
                 clean_text = re.sub(r'\s*```$', '', clean_text)
             clean_text = clean_text.strip()
             
-            translated_list = json.loads(clean_text)
-            if isinstance(translated_list, list) and len(translated_list) == len(texts):
-                return [str(item).strip() for item in translated_list]
-            else:
-                raise ValueError("Ollama 批量翻译响应列表长度不一致")
+            translated_dict = json.loads(clean_text)
+            if not isinstance(translated_dict, dict):
+                raise ValueError("Ollama 未能成功生成 JSON 键值对对象")
+                
+            results = []
+            # 2. 依次按 Key 提取结果
+            for i, original_text in enumerate(texts):
+                key = f"k_{i}"
+                if key in translated_dict and str(translated_dict[key]).strip():
+                    results.append(str(translated_dict[key]).strip())
+                else:
+                    # 3. 【自愈降级】：如果大模型在 High Temp 下遗漏了当前 key，仅对此单行执行单句翻译，绝不废弃整批！
+                    print(f"[Ollama 批量自愈] 检测到模型遗漏了 Key: {key}，正在执行单句高容错补全...")
+                    fallback_val = self._translate_via_ollama(original_text, from_code, to_code)
+                    results.append(fallback_val)
+                    
+            return results
         except Exception as e:
             raise e
 
