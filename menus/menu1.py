@@ -1,15 +1,28 @@
 # -*- coding: utf-8 -*-
-# 文件路径：menus/menu1.py
 import hashlib
-import urllib.request
-import time
-import threading
+import html as html_mod
+import re
 from pathlib import Path
-from PyQt6.QtWidgets import (QVBoxLayout, QHBoxLayout, QTextEdit, QTextBrowser, QPushButton, QLabel, QFrame, QListWidget, QWidget, QLineEdit, QSlider, QScrollArea, QGridLayout, QApplication, QComboBox)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl, QTimer, QPointF, QEvent
+
+from PyQt6.QtWidgets import (
+    QVBoxLayout, QHBoxLayout, QTextEdit, QTextBrowser, QPushButton,
+    QLabel, QFrame, QListWidget, QWidget, QLineEdit, QSlider,
+    QScrollArea, QGridLayout, QApplication, QComboBox
+)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl, QTimer, QEvent
 from PyQt6.QtGui import QPainter, QColor, QPen
+
 from .base_menu import BaseMenuWidget
 from engine.rule_engine import RuleContext
+from core.paths import get_app_root
+
+from ui.widgets.focus_frame import FocusFrame
+from ui.widgets.capsule_button import CapsuleButton
+from ui.widgets.timeline_ticks import TimelineTicks
+from ui.widgets.video_player import ExternalVideoWindow
+from ui.workers.download_worker import VideoDownloadWorker
+from ui.workers.translate_worker import TranslateWorker, FormatWorker
+from ui.workers.model_detect_worker import ModelDetectWorker
 
 try:
     from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -18,422 +31,39 @@ try:
 except ImportError:
     MULTIMEDIA_SUPPORTED = False
 
-def get_root_path():
-    """
-    自适应获取物理根目录。
-    * 完美解决打包后由于临时目录释放导致的寻址错误和视频下载缓存失败
-    """
-    import sys
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent
-    else:
-        return Path(__file__).resolve().parents[1]
-
-class ExternalVideoWindow(QWidget):
-    """
-    📺 独立物理外部视频播放视窗（高内聚设计：支持窗口永远置顶、焦点防丢失重定向与快捷键同步）
-    """
-    def __init__(self, player, main_menu):
-        super().__init__()
-        self.player = player
-        self.main_menu = main_menu
-        self.setWindowTitle("📺 视频独立播放视窗 (双屏/大图细节模式)")
-        self.resize(800, 600)
-        self.setStyleSheet("background-color: #000000;")
-        
-        # 允许键盘强对焦
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        
-        # 【优化1】：设置窗口永远保持在界面最上方（WindowStaysOnTopHint）
-        self.setWindowFlags(
-            Qt.WindowType.Window | 
-            Qt.WindowType.WindowStaysOnTopHint | 
-            Qt.WindowType.WindowMinMaxButtonsHint | 
-            Qt.WindowType.WindowCloseButtonHint
-        )
-        
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.video_widget = QVideoWidget(self)
-        # 允许视频视窗强对焦，并安装事件过滤器
-        self.video_widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.video_widget.installEventFilter(self)
-        
-        layout.addWidget(self.video_widget)
-        
-        # 热迁移渲染目标
-        self.player.setVideoOutput(self.video_widget)
-        
-        # 启动后默认将焦点吸附到本窗口
-        self.setFocus()
-
-    def eventFilter(self, obj, event):
-        """
-        【优化2】：焦点防吞。用户点击外部视窗任何地方，焦点都会被重定向到本窗口本体，防止键盘快捷键失效
-        """
-        if obj == self.video_widget:
-            if event.type() == QEvent.Type.MouseButtonPress:
-                self.setFocus()
-                event.accept()
-                return True
-        return super().eventFilter(obj, event)
-
-    def keyPressEvent(self, event):
-        """
-        【优化3】：键盘透传。副窗口获得焦点时，键盘对视频的所有快捷操作无缝可用，高内聚复用 main_menu 的底层方法
-        """
-        if not MULTIMEDIA_SUPPORTED:
-            super().keyPressEvent(event)
-            return
-            
-        key = event.key()
-        if key == Qt.Key.Key_Space:
-            self.main_menu.toggle_playback()
-            event.accept()
-        elif key == Qt.Key.Key_Left:
-            self.main_menu.seek_offset(-5000)
-            event.accept()
-        elif key == Qt.Key.Key_Right:
-            self.main_menu.seek_offset(5000)
-            event.accept()
-        elif key == Qt.Key.Key_Up:
-            self.main_menu.adjust_volume_offset(5)
-            event.accept()
-        elif key == Qt.Key.Key_Down:
-            self.main_menu.adjust_volume_offset(-5)
-            event.accept()
-        else:
-            super().keyPressEvent(event)
-        
-    def closeEvent(self, event):
-        # 窗口关闭时，归还渲染目标
-        self.main_menu.restore_video_to_embedded()
-        super().closeEvent(event)
-
-
-class FocusFrame(QFrame):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-    def mousePressEvent(self, event):
-        self.setFocus()
-        super().mousePressEvent(event)
-
-class TimelineTicks(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(12)
-        self.duration_ms = 0
-    def set_duration(self, duration_ms: int):
-        self.duration_ms = duration_ms
-        self.update()
-    def paintEvent(self, event):
-        if self.duration_ms <= 0: return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor("#27272a"), 1))
-        painter.drawLine(0, 1, self.width(), 1)
-        one_minute = 60000
-        num_ticks = int(self.duration_ms / one_minute)
-        painter.setPen(QPen(QColor("#52525b"), 1))
-        for i in range(1, num_ticks + 1):
-            x = int(((i * one_minute) / self.duration_ms) * self.width())
-            painter.drawLine(x, 1, x, 6)
-            if num_ticks <= 15:
-                font = painter.font()
-                font.setPointSize(7)
-                painter.setFont(font)
-                painter.setPen(QPen(QColor("#71717a")))
-                painter.drawText(x - 6, 12, f"{i}m")
-
-class CapsuleButton(QPushButton):
-    def __init__(self, text: str, parent=None):
-        super().__init__(text, parent)
-        self.setObjectName("CapsuleBtn")
-        self.original_text = text
-        self.clicked.connect(self.trigger_copied_effect)
-    def trigger_copied_effect(self):
-        self.setText("✓ 已复制")
-        self.setStyleSheet("QPushButton#CapsuleBtn { background-color: #059669; color: #ffffff; border: 1px solid #34d399; font-weight: bold; }")
-        QTimer.singleShot(800, self.restore_state)
-    def restore_state(self):
-        self.setText(self.original_text)
-        self.setStyleSheet("")
-
-class ChunkDownloader(threading.Thread):
-    def __init__(self, url, start_byte, end_byte, part_path):
-        super().__init__()
-        self.url, self.start_byte, self.end_byte, self.part_path = url, start_byte, end_byte, part_path
-        self.downloaded, self.error, self.is_cancelled = 0, None, False
-    def run(self):
-        try:
-            req = urllib.request.Request(self.url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Range": f"bytes={self.start_byte}-{self.end_byte}"})
-            with urllib.request.urlopen(req, timeout=10) as response:
-                if response.getcode() != 206: raise Exception("服务器拒绝了分片 Range 请求")
-                block_size = 256 * 1024  
-                with open(self.part_path, "wb") as f:
-                    while not self.is_cancelled:
-                        chunk = response.read(block_size)
-                        if not chunk: break
-                        f.write(chunk)
-                        self.downloaded += len(chunk)
-        except Exception as e: self.error = str(e)
-
-class VideoDownloadWorker(QThread):
-    progress_info = pyqtSignal(int, float, float, float)
-    finished = pyqtSignal(str)
-    error = pyqtSignal(str)
-    def __init__(self, url: str, target_file_path: Path):
-        super().__init__()
-        self.url, self.target_file_path = url, target_file_path
-        self.is_cancelled, self.num_threads, self.max_retries = False, 4, 3
-    def cancel(self): self.is_cancelled = True
-    def calculate_optimal_chunks(self, total_size_bytes: int) -> int:
-        mb = 1024 * 1024
-        if total_size_bytes < 5 * mb: return 1   
-        elif total_size_bytes < 20 * mb: return 2   
-        elif total_size_bytes < 50 * mb: return 4   
-        elif total_size_bytes < 100 * mb: return 6   
-        else: return 8   
-    def run(self):
-        retries = 0
-        while retries <= self.max_retries and not self.is_cancelled:
-            try:
-                req = urllib.request.Request(self.url, method="HEAD", headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-                supports_range = False
-                total_size = -1
-                try:
-                    with urllib.request.urlopen(req, timeout=8) as response:
-                        accept_ranges = response.info().get('Accept-Ranges', '')
-                        total_size = int(response.info().get('Content-Length')) if response.info().get('Content-Length') is not None else -1
-                        supports_range = (accept_ranges.lower() == 'bytes')
-                except Exception:
-                    req_get = urllib.request.Request(self.url, headers={"User-Agent": "Mozilla/5.0", "Range": "bytes=0-0"})
-                    try:
-                        with urllib.request.urlopen(req_get, timeout=8) as response_get:
-                            supports_range = (response_get.getcode() == 206)
-                            content_range = response_get.info().get('Content-Range', '')
-                            if "/" in content_range: total_size = int(content_range.split("/")[-1])
-                    except: pass
-                if supports_range and total_size > 4 * 1024 * 1024:
-                    self.num_threads = self.calculate_optimal_chunks(total_size)
-                    self.execute_multi_threaded_download(total_size)
-                else: self.execute_single_threaded_download()
-                return
-            except Exception as e:
-                retries += 1
-                if retries > self.max_retries or self.is_cancelled:
-                    if self.target_file_path.exists():
-                        try: self.target_file_path.unlink()
-                        except: pass
-                    self.error.emit(f"下载失败: {e}")
-                    return
-                else: self.msleep(2000)
-    def execute_multi_threaded_download(self, total_size: int):
-        chunk_size = total_size // self.num_threads
-        threads, part_paths = [], []
-        start_time = time.time()
-        last_emit_time = 0.0
-        for i in range(self.num_threads):
-            start_byte = i * chunk_size
-            end_byte = total_size - 1 if i == self.num_threads - 1 else (start_byte + chunk_size - 1)
-            part_path = self.target_file_path.with_suffix(f"{self.target_file_path.suffix}.part{i}")
-            part_paths.append(part_path)
-            t = ChunkDownloader(self.url, start_byte, end_byte, part_path)
-            threads.append(t)
-            t.start()
-        while any(t.is_alive() for t in threads) and not self.is_cancelled:
-            current_time = time.time()
-            if current_time - last_emit_time > 0.15:
-                last_emit_time = current_time
-                dl = sum(t.downloaded for t in threads)
-                speed_mbs = (dl / (current_time - start_time)) / (1024 * 1024) if current_time - start_time > 0 else 0.0
-                percent = int((dl * 100) / total_size)
-                if percent >= 100: percent = 99
-                self.progress_info.emit(percent, speed_mbs, total_size / (1024 * 1024), dl / (1024 * 1024))
-            self.msleep(100)
-        if self.is_cancelled:
-            for t in threads: t.is_cancelled = True
-            for t in threads: t.join()
-            for path in part_paths:
-                if path.exists():
-                    try: path.unlink()
-                    except: pass
-            return
-        for t in threads:
-            t.join()
-            if t.error:
-                for path in part_paths:
-                    if path.exists():
-                        try: path.unlink()
-                        except: pass
-                raise Exception(f"分片下载中断: {t.error}")
-        elapsed_total = time.time() - start_time
-        self.progress_info.emit(100, (total_size / elapsed_total) / (1024 * 1024) if elapsed_total > 0 else 0.0, total_size / (1024 * 1024), total_size / (1024 * 1024))
-        try:
-            with open(self.target_file_path, "wb") as dest:
-                for path in part_paths:
-                    with open(path, "rb") as src:
-                        while True:
-                            buf = src.read(1024 * 1024)
-                            if not buf: break
-                            dest.write(buf)
-                    path.unlink() 
-            self.finished.emit(str(self.target_file_path.resolve()))
-        except Exception as e: raise Exception(f"分片合并失败: {e}")
-    def execute_single_threaded_download(self):
-        bytes_downloaded = 0
-        req = urllib.request.Request(self.url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-        start_time = time.time()
-        last_emit_time = 0.0
-        with urllib.request.urlopen(req, timeout=10) as response:
-            total_size = int(response.info().get('Content-Length')) if response.info().get('Content-Length') is not None else -1
-            total_size_mb = total_size / (1024 * 1024) if total_size > 0 else 0.0
-            block_size = 256 * 1024
-            with open(self.target_file_path, "wb") as f:
-                while not self.is_cancelled:
-                    chunk = response.read(block_size)
-                    if not chunk: break
-                    f.write(chunk)
-                    bytes_downloaded += len(chunk)
-                    current_time = time.time()
-                    if (current_time - last_emit_time > 0.15) or (total_size > 0 and bytes_downloaded >= total_size):
-                        last_emit_time = current_time
-                        speed_mbs = (bytes_downloaded / (current_time - start_time)) / (1024.0 * 1024.0) if current_time - start_time > 0 else 0.0
-                        downloaded_mb = bytes_downloaded / (1024.0 * 1024.0)
-                        if total_size > 0:
-                            self.progress_info.emit(int((bytes_downloaded * 100) / total_size), speed_mbs, total_size_mb, downloaded_mb)
-                        else:
-                            self.progress_info.emit(-1, speed_mbs, downloaded_mb, downloaded_mb)
-        if not self.is_cancelled:
-            self.progress_info.emit(100, (bytes_downloaded / (time.time() - start_time)) / (1024 * 1024), total_size_mb, total_size_mb)
-            self.finished.emit(str(self.target_file_path.resolve()))
-
-class TranslateWorker(QThread):
-    finished = pyqtSignal(str)
-    error = pyqtSignal(str)
-    def __init__(self, engine, text: str, engine_mode: str):
-        super().__init__()
-        self.engine, self.text, self.engine_mode = engine, text, engine_mode
-    def run(self):
-        try:
-            from engine.rules import TextCleanupRule, ActualTranslationRule
-            self.engine.clear_rules()
-            self.engine.register_rule(TextCleanupRule())
-            self.engine.register_rule(ActualTranslationRule())
-            context = RuleContext(raw_source=self.text)
-            context.metadata["mode"] = "en_to_zh"
-            context.metadata["engine"] = self.engine_mode
-            res = self.engine.run(context)
-            self.finished.emit(res.raw_target)
-        except Exception as e: self.error.emit(str(e))
-
-class FormatWorker(QThread):
-    finished = pyqtSignal(object)
-    error = pyqtSignal(str)
-    def __init__(self, engine, source_text: str, engine_mode: str):
-        super().__init__()
-        self.engine, self.source_text, self.engine_mode = engine, source_text, engine_mode
-    def run(self):
-        try:
-            from engine.rules import VideoTimelineParseRule, TextCleanupRule
-            self.engine.clear_rules()
-            self.engine.register_rule(VideoTimelineParseRule())
-            self.engine.register_rule(TextCleanupRule())
-            context = RuleContext(raw_source=self.source_text)
-            context.metadata["engine"] = self.engine_mode
-            result = self.engine.run(context)
-            self.finished.emit(result)
-        except Exception as e: self.error.emit(str(e))
-
-class ModelDetectWorker(QThread):
-    finished_detect = pyqtSignal(list)
-    
-    def run(self):
-        offline_items = []
-        try:
-            # 隔离代理快速探测 Ollama
-            proxy_handler = urllib.request.ProxyHandler({})
-            opener = urllib.request.build_opener(proxy_handler)
-            req = urllib.request.Request("http://localhost:11434/api/tags")
-            with opener.open(req, timeout=1.0) as response:
-                if response.status == 200:
-                    offline_items.append("🤖 Ollama (本地大模型)")
-        except: pass
-
-        models_dir = get_root_path() / "models"
-        
-        # 【重要修复】：不仅检查 MarianMT 物理模型，还必须验证环境是否装有 transformers、torch 等依赖库
-        has_marian_libs = False
-        if (models_dir / "opus-mt-en-zh").exists():
-            try:
-                import transformers
-                import torch
-                import sentencepiece
-                has_marian_libs = True
-            except ImportError:
-                pass
-        if has_marian_libs:
-            offline_items.append("📦 MarianMT (本地小模型)")
-
-        # 【重要修复】：不仅检查 Argos 物理模型，还必须验证环境是否装有 argostranslate 依赖库
-        has_argos_libs = False
-        if len(list(models_dir.glob("translate-en_zh-*.argosmodel"))) > 0:
-            try:
-                import argostranslate
-                has_argos_libs = True
-            except ImportError:
-                pass
-        if has_argos_libs:
-            offline_items.append("📦 Argos NMT (本地轻量级)")
-
-        if offline_items:
-            self.finished_detect.emit(offline_items)
 
 class MenuWidget(BaseMenuWidget):
     def open_external_video_window(self):
-        """
-        【新增】：热迁移渲染管线至独立的外部播放窗口，保留进度无缝播放
-        """
         if not MULTIMEDIA_SUPPORTED or not hasattr(self, "player") or not self.player.source().isValid():
             return
-            
+
         pos = self.player.position()
         self.player.pause()
-        
-        # 如果已经开着一个，先关闭
+
         if hasattr(self, "popup_window") and self.popup_window:
             self.popup_window.close()
-            
-        # 实例化热迁移独立视窗
+
         self.popup_window = ExternalVideoWindow(self.player, self)
         self.popup_window.show()
-        
-        # 原位置继续无缝唤醒播放
+
         self.player.setPosition(pos)
         self.player.play()
         self.btn_play_pause.setText("⏸ 暂停")
 
     def restore_video_to_embedded(self):
-        """
-        【新增】：热迁移渲染管线退避，重新归还至主界面内嵌组件中
-        """
         if not MULTIMEDIA_SUPPORTED or not hasattr(self, "player"):
             return
-            
+
         pos = self.player.position()
         self.player.pause()
-        
-        # 重新将已存在的视频输出流绑定给主界面的 QVideoWidget
+
         self.player.setVideoOutput(self.video_widget)
         self.player.setPosition(pos)
         self.player.play()
         self.btn_play_pause.setText("⏸ 暂停")
         self.popup_window = None
-    
+
     def init_ui(self):
-        # 极简样式表高度融合
         self.setStyleSheet("""
             QFrame#SectionFrame, QFrame#VideoFrame, QFrame#SubLeftFrame { background-color: #161619; border: 1px solid #27272a; border-radius: 8px; padding: 10px; }
             QFrame#VideoFrame:focus { border: 1px solid #3b82f6; }
@@ -515,12 +145,20 @@ class MenuWidget(BaseMenuWidget):
         self.btn_clip_video.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_clip_video.clicked.connect(self.load_video_from_clipboard)
         url_layout.addWidget(self.btn_clip_video)
+
+        self.btn_fill_all = QPushButton("⚡ 一键填充", self)
+        self.btn_fill_all.setObjectName("ClipBtn")
+        self.btn_fill_all.setFixedWidth(85)
+        self.btn_fill_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_fill_all.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_fill_all.clicked.connect(self.one_click_fill)
+        url_layout.addWidget(self.btn_fill_all)
         video_layout.addLayout(url_layout)
 
         self.video_canvas_container = QWidget(self)
         self.video_canvas_layout = QVBoxLayout(self.video_canvas_container)
         self.video_canvas_layout.setContentsMargins(0, 0, 0, 0)
-        
+
         self.control_bar = QWidget(self)
         control_bar_layout = QVBoxLayout(self.control_bar)
         control_bar_layout.setContentsMargins(0, 0, 0, 0)
@@ -557,7 +195,7 @@ class MenuWidget(BaseMenuWidget):
         self.btn_popup_play.clicked.connect(self.open_external_video_window)
         self.btn_popup_play.setEnabled(False)
         buttons_layout.addWidget(self.btn_popup_play)
-        
+
         buttons_layout.addStretch()
 
         self.time_label = QLabel("00:00 / 00:00", self)
@@ -624,7 +262,6 @@ class MenuWidget(BaseMenuWidget):
         left_main_layout.addWidget(self.phrase_frame, stretch=2)
         main_horizontal_layout.addWidget(left_main_widget, stretch=45)
 
-        # ================== 右侧对照面板 ==================
         right_main_widget = QWidget(self)
         right_main_layout = QVBoxLayout(right_main_widget)
         right_main_layout.setContentsMargins(0, 0, 0, 0)
@@ -635,7 +272,15 @@ class MenuWidget(BaseMenuWidget):
         upper_layout = QVBoxLayout(self.upper_frame)
         upper_layout.setContentsMargins(8, 8, 8, 8)
         upper_layout.setSpacing(8)
-        upper_layout.addWidget(QLabel("🗣️ 1. 在线双路并行对照翻译", self, objectName="SectionHeader"))
+        upper_header_layout = QHBoxLayout()
+        upper_header_layout.setContentsMargins(0, 0, 0, 0)
+        upper_header_layout.addWidget(QLabel("🗣️ 1. 在线双路并行对照翻译", self, objectName="SectionHeader"))
+        upper_header_layout.addStretch()
+        self.engine_label = QLabel("", self)
+        self.engine_label.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold; background-color: #1e1b4b; border: 1px solid #4338ca; border-radius: 6px; padding: 2px 10px;")
+        self.engine_label.hide()
+        upper_header_layout.addWidget(self.engine_label)
+        upper_layout.addLayout(upper_header_layout)
 
         translate_columns = QHBoxLayout()
         translate_columns.setSpacing(8)
@@ -653,11 +298,9 @@ class MenuWidget(BaseMenuWidget):
 
         online_actions_layout = QHBoxLayout()
         online_actions_layout.setSpacing(8)
-        
-        # 下拉切换菜单 (加宽，防字符截断)
+
         self.combo_mode_upper = QComboBox(self)
         self.combo_mode_upper.setMinimumWidth(210)
-        # 【新增】：强制物理高度锁死为 34px，与右侧 QPushButton 绝对对齐
         self.combo_mode_upper.setFixedHeight(34)
         online_actions_layout.addWidget(self.combo_mode_upper)
 
@@ -674,7 +317,7 @@ class MenuWidget(BaseMenuWidget):
         self.btn_abort_upper.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_abort_upper.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_abort_upper.clicked.connect(self.abort_upper_translation)
-        self.btn_abort_upper.setEnabled(False)  
+        self.btn_abort_upper.setEnabled(False)
         online_actions_layout.addWidget(self.btn_abort_upper)
 
         self.btn_clip_online = QPushButton("📋 读剪切板翻译", self)
@@ -691,7 +334,15 @@ class MenuWidget(BaseMenuWidget):
         lower_layout = QVBoxLayout(self.lower_frame)
         lower_layout.setContentsMargins(8, 8, 8, 8)
         lower_layout.setSpacing(8)
-        lower_layout.addWidget(QLabel("🧬 2. 事件节点格式优化与离线解析", self, objectName="SectionHeader"))
+        lower_header_layout = QHBoxLayout()
+        lower_header_layout.setContentsMargins(0, 0, 0, 0)
+        lower_header_layout.addWidget(QLabel("🧬 2. 事件节点格式优化与离线解析", self, objectName="SectionHeader"))
+        lower_header_layout.addStretch()
+        self.format_engine_label = QLabel("", self)
+        self.format_engine_label.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold; background-color: #1e1b4b; border: 1px solid #4338ca; border-radius: 6px; padding: 2px 10px;")
+        self.format_engine_label.hide()
+        lower_header_layout.addWidget(self.format_engine_label)
+        lower_layout.addLayout(lower_header_layout)
 
         format_columns = QHBoxLayout()
         format_columns.setSpacing(8)
@@ -725,11 +376,9 @@ class MenuWidget(BaseMenuWidget):
 
         offline_actions_layout = QHBoxLayout()
         offline_actions_layout.setSpacing(8)
-        
-        # 下拉切换菜单 (加宽，防字符截断)
+
         self.combo_mode_lower = QComboBox(self)
         self.combo_mode_lower.setMinimumWidth(210)
-        # 【新增】：强制物理高度锁死为 34px，与右侧 QPushButton 绝对对齐
         self.combo_mode_lower.setFixedHeight(34)
         offline_actions_layout.addWidget(self.combo_mode_lower)
 
@@ -746,7 +395,7 @@ class MenuWidget(BaseMenuWidget):
         self.btn_abort_lower.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_abort_lower.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_abort_lower.clicked.connect(self.abort_lower_formatting)
-        self.btn_abort_lower.setEnabled(False)  
+        self.btn_abort_lower.setEnabled(False)
         offline_actions_layout.addWidget(self.btn_abort_lower)
 
         self.btn_clip_offline = QPushButton("📋 读剪切板解析", self)
@@ -764,9 +413,6 @@ class MenuWidget(BaseMenuWidget):
         self.update_engine_combobox_labels()
 
     def update_engine_combobox_labels(self):
-        """
-        异步后台路由项加载，采用 Qt 标准线程通信，消除冷启动卡顿与静默失败。
-        """
         routing_items = [
             "☁️ 在线优先 (自动降级)",
             "💻 本地优先 (自动降级)"
@@ -776,7 +422,6 @@ class MenuWidget(BaseMenuWidget):
         self.combo_mode_lower.clear()
         self.combo_mode_lower.addItems(routing_items)
 
-        # 启动合法 QThread 守护线程后台探测
         self.detect_worker = ModelDetectWorker(self)
         self.detect_worker.finished_detect.connect(self._apply_detected_models)
         self.detect_worker.start()
@@ -784,30 +429,36 @@ class MenuWidget(BaseMenuWidget):
     def _apply_detected_models(self, offline_items):
         self.combo_mode_upper.addItems(offline_items)
         self.combo_mode_lower.addItems(offline_items)
-        
+
         ollama_text = "🤖 Ollama (本地大模型)"
         idx = self.combo_mode_upper.findText(ollama_text)
         if idx != -1:
             self.combo_mode_upper.setCurrentIndex(idx)
             self.combo_mode_lower.setCurrentIndex(idx)
 
-
     def get_selected_engine_key(self, combobox: QComboBox) -> str:
         text = combobox.currentText()
-        if "在线优先" in text: return "online_first"
-        elif "本地优先" in text: return "local_first"
-        elif "Ollama" in text: return "ollama"
-        elif "MarianMT" in text: return "transformers"
-        elif "Argos" in text: return "argos"
+        if "在线优先" in text:
+            return "online_first"
+        elif "本地优先" in text:
+            return "local_first"
+        elif "Ollama" in text:
+            return "ollama"
+        elif "MarianMT" in text:
+            return "transformers"
+        elif "Argos" in text:
+            return "argos"
         return "online_first"
 
     def abort_upper_translation(self):
         if hasattr(self, "trans_worker") and self.trans_worker.isRunning():
-            self.trans_worker.terminate()  
+            self.trans_worker.terminate()
             self.trans_worker.wait()
+            self.engine_label.hide()
             self._reset_upper_ui()
             mw = self.window()
-            if mw and hasattr(mw, "status_bar"): mw.status_bar.showMessage("⏹ 在线翻译任务已由用户强行中止。", 3000)
+            if mw and hasattr(mw, "status_bar"):
+                mw.status_bar.showMessage("⏹ 在线翻译任务已由用户强行中止。", 3000)
 
     def _reset_upper_ui(self):
         self.btn_online.setEnabled(True)
@@ -818,9 +469,11 @@ class MenuWidget(BaseMenuWidget):
         if hasattr(self, "format_worker") and self.format_worker.isRunning():
             self.format_worker.terminate()
             self.format_worker.wait()
+            self.format_engine_label.hide()
             self._reset_lower_ui()
             mw = self.window()
-            if mw and hasattr(mw, "status_bar"): mw.status_bar.showMessage("⏹ 离线格式化解析任务已由用户强行中止。", 3000)
+            if mw and hasattr(mw, "status_bar"):
+                mw.status_bar.showMessage("⏹ 离线格式化解析任务已由用户强行中止。", 3000)
 
     def _reset_lower_ui(self):
         self.btn_offline.setEnabled(True)
@@ -828,49 +481,51 @@ class MenuWidget(BaseMenuWidget):
         self.btn_abort_lower.setEnabled(False)
 
     def load_words_config(self):
-        words_path = get_root_path() / "words.txt"
+        words_path = get_app_root() / "words.txt"
         phrases = []
         if words_path.exists():
             try:
                 with open(words_path, "r", encoding="utf-8") as f:
                     phrases = [line.strip() for line in f if line.strip()]
-            except Exception: pass
+            except Exception:
+                pass
         else:
             phrases = [
                 "在线大雄兔###https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
                 "在线玩具世界###https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
-                "极佳编辑###Brilliant editing", 
-                "一键加速###Hurry up", 
-                "Check this", 
+                "极佳编辑###Brilliant editing",
+                "一键加速###Hurry up",
+                "Check this",
                 "Behind scenes"
             ]
             try:
                 with open(words_path, "w", encoding="utf-8") as f:
                     f.write("\n".join(phrases))
-            except: pass
+            except Exception:
+                pass
 
         cols = 2
         for idx, text in enumerate(phrases):
             row = idx // cols
             col = idx % cols
             if "###" in text:
-                parts = text.split("###", 1)  
+                parts = text.split("###", 1)
                 title_part = parts[0].strip()
                 copy_part = parts[1].strip()
-                
+
                 cell_widget = QWidget(self)
                 cell_layout = QHBoxLayout(cell_widget)
                 cell_layout.setContentsMargins(0, 0, 0, 0)
                 cell_layout.setSpacing(4)
-                
+
                 title_lbl = QLabel(title_part, self)
                 title_lbl.setStyleSheet("color: #71717a; font-size: 11px; font-weight: bold;")
-                
+
                 btn = CapsuleButton(copy_part, self)
                 btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
                 btn.clicked.connect(lambda checked, t=copy_part: self.copy_phrase_to_clipboard(t))
-                
+
                 cell_layout.addWidget(title_lbl)
                 cell_layout.addWidget(btn, stretch=1)
                 self.grid_layout.addWidget(cell_widget, row, col)
@@ -883,8 +538,10 @@ class MenuWidget(BaseMenuWidget):
 
     def copy_phrase_to_clipboard(self, text: str):
         clipboard = QApplication.clipboard()
-        clipboard.setText(text)
         mw = self.window()
+        if mw and hasattr(mw, "clipboard_monitor"):
+            mw.clipboard_monitor.mark_written(text)
+        clipboard.setText(text)
         if mw and hasattr(mw, "status_bar"):
             mw.status_bar.showMessage(f"📋 短语已成功复制到剪切板: \"{text}\"", 2000)
 
@@ -930,7 +587,8 @@ class MenuWidget(BaseMenuWidget):
             try:
                 import os
                 os.startfile(local_path)
-            except Exception: pass
+            except Exception:
+                pass
 
     def on_playback_state_changed(self, state):
         if state == QMediaPlayer.PlaybackState.PlayingState:
@@ -982,26 +640,91 @@ class MenuWidget(BaseMenuWidget):
     def seek_offset(self, ms_offset: int):
         new_pos = self.player.position() + ms_offset
         duration = self.player.duration()
-        if new_pos < 0: new_pos = 0
-        elif duration > 0 and new_pos > duration: new_pos = duration
+        if new_pos < 0:
+            new_pos = 0
+        elif duration > 0 and new_pos > duration:
+            new_pos = duration
         self.player.setPosition(new_pos)
         self.progress_slider.setValue(new_pos)
 
     def adjust_volume_offset(self, vol_offset: int):
         current_vol = self.volume_slider.value()
         new_vol = current_vol + vol_offset
-        if new_vol < 0: new_vol = 0
-        elif new_vol > 100: new_vol = 100
+        if new_vol < 0:
+            new_vol = 0
+        elif new_vol > 100:
+            new_vol = 100
         self.volume_slider.setValue(new_vol)
 
     def load_video_from_clipboard(self):
-        if not MULTIMEDIA_SUPPORTED: return
+        if not MULTIMEDIA_SUPPORTED:
+            return
         text = QApplication.clipboard().text().strip()
         if text.startswith(("http://", "https://")) and any(ext in text.lower() for ext in (".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".3gp")):
             self.url_input.setText(text)
             self.load_video_url()
             mw = self.window()
-            if mw and hasattr(mw, "status_bar"): mw.status_bar.showMessage("🎬 成功从剪切板载入视频！", 3000)
+            if mw and hasattr(mw, "status_bar"):
+                mw.status_bar.showMessage("🎬 成功从剪切板载入视频！", 3000)
+
+    def one_click_fill(self):
+        mw = self.window()
+        if not mw or not hasattr(mw, "clipboard_monitor"):
+            if mw and hasattr(mw, "status_bar"):
+                mw.status_bar.showMessage("📋 剪切板监听未就绪。", 3000)
+            return
+
+        recent = mw.clipboard_monitor.get_recent(3)
+        if not recent:
+            if mw and hasattr(mw, "status_bar"):
+                mw.status_bar.showMessage("📋 剪切板历史为空，请先复制内容。", 3000)
+            return
+
+        first_text = recent[0].strip() if recent else ""
+        first_is_url = first_text.lower().startswith(("http://", "https://"))
+
+        slots_filled = {"video": False, "translation": False, "timeline": False}
+
+        if first_is_url:
+            items = recent
+        else:
+            items = recent[:2]
+
+        for text in items:
+            text = text.strip()
+            if not text:
+                continue
+
+            is_video_url = (text.lower().startswith(("http://", "https://")) and
+                           any(ext in text.lower() for ext in (".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".3gp")))
+            is_json = text.startswith("[") and text.endswith("]")
+
+            if is_video_url and not slots_filled["video"]:
+                self.url_input.setText(text)
+                self.load_video_url()
+                slots_filled["video"] = True
+            elif is_json and not slots_filled["timeline"]:
+                self.src_input.setPlainText(text)
+                self.start_offline_optimization()
+                slots_filled["timeline"] = True
+            elif not slots_filled["translation"]:
+                self.input_a.setPlainText(text)
+                self.start_online_translation()
+                slots_filled["translation"] = True
+
+            if all(slots_filled.values()):
+                break
+
+        filled = sum(1 for v in slots_filled.values() if v)
+        if mw and hasattr(mw, "status_bar"):
+            parts = []
+            if slots_filled["video"]:
+                parts.append("视频链接")
+            if slots_filled["translation"]:
+                parts.append("翻译区")
+            if slots_filled["timeline"]:
+                parts.append("时间线解析")
+            mw.status_bar.showMessage(f"🚀 一键填充完成：{', '.join(parts)} 共 {filled} 个区域。", 4000)
 
     def translate_clipboard_online(self):
         text = QApplication.clipboard().text().strip()
@@ -1018,15 +741,18 @@ class MenuWidget(BaseMenuWidget):
     def on_volume_changed(self, value: int):
         if MULTIMEDIA_SUPPORTED and hasattr(self, "audio_output"):
             self.audio_output.setVolume(value / 100.0)
-            if value == 0: self.lbl_volume.setText("🔇")
-            elif value < 40: self.lbl_volume.setText("🔈")
-            else: self.lbl_volume.setText("🔊")
+            if value == 0:
+                self.lbl_volume.setText("🔇")
+            elif value < 40:
+                self.lbl_volume.setText("🔈")
+            else:
+                self.lbl_volume.setText("🔊")
 
     def jump_to_timestamp(self):
         raw_text = self.timestamp_input.text().strip()
-        if not raw_text or not MULTIMEDIA_SUPPORTED: return
+        if not raw_text or not MULTIMEDIA_SUPPORTED:
+            return
         try:
-            import re
             parts = re.split(r'[:\.]', raw_text)
             ms = 0
 
@@ -1042,20 +768,21 @@ class MenuWidget(BaseMenuWidget):
                 ms = int(parts[3])
             else:
                 raise ValueError()
-            
+
             target_ms = int(total_seconds * 1000) + ms
-            
+
             duration = self.player.duration()
-            if target_ms < 0: target_ms = 0
-            elif duration > 0 and target_ms > duration: target_ms = duration
-            
+            if target_ms < 0:
+                target_ms = 0
+            elif duration > 0 and target_ms > duration:
+                target_ms = duration
+
             self.player.setPosition(target_ms)
             self.progress_slider.setValue(target_ms)
-            
-            # 【重要优化】：跳转时间戳后直接唤醒播放器并同步按钮状态
+
             self.player.play()
             self.btn_play_pause.setText("⏸ 暂停")
-            
+
             self.video_frame.setFocus()
             self.timestamp_input.clearFocus()
         except Exception:
@@ -1070,41 +797,34 @@ class MenuWidget(BaseMenuWidget):
             self.jump_to_timestamp()
 
     def clear_local_cache(self):
-        """
-        【彻底修复】：防连点卡退，并安全终止进行中的下载任务与文件锁
-        """
-        self.btn_clear_cache.setEnabled(False) # 立即锁死按键，防连点崩溃
+        self.btn_clear_cache.setEnabled(False)
 
-        # 1. 如果正在下载，必须先优雅取消并强制等待线程销毁，防止文件流死锁
         if hasattr(self, "download_worker") and self.download_worker.isRunning():
             self.download_worker.progress_info.disconnect()
             self.download_worker.finished.disconnect()
             self.download_worker.error.disconnect()
-            self.download_worker.cancel()  
-            self.download_worker.wait()    
+            self.download_worker.cancel()
+            self.download_worker.wait()
 
-        # 2. 释放播放器文件句柄
         if MULTIMEDIA_SUPPORTED and hasattr(self, "player"):
             self.player.stop()
             self.player.setSource(QUrl())
         QApplication.processEvents()
 
-        # 3. 执行物理文件清理
-        cache_dir = get_root_path() / "cache"
+        cache_dir = get_app_root() / "cache"
         deleted_count = 0
         failed_count = 0
         if cache_dir.exists():
             for item in cache_dir.iterdir():
                 if item.is_file():
-                    try: 
+                    try:
                         item.unlink()
                         deleted_count += 1
-                    except Exception as e: 
+                    except Exception as e:
                         import logging
                         logging.warning(f"缓存文件删除失败: {e}")
                         failed_count += 1
 
-        # 4. 重置 UI 状态
         self.btn_play_pause.setEnabled(False)
         self.btn_popup_play.setEnabled(False)
         self.btn_play_pause.setText("▶ 播放")
@@ -1112,17 +832,16 @@ class MenuWidget(BaseMenuWidget):
         self.progress_slider.setEnabled(False)
         self.time_label.setText("00:00 / 00:00")
         self.timeline_ticks.set_duration(0)
-        
+
         mw = self.window()
-        if mw and hasattr(mw, "status_bar"): 
+        if mw and hasattr(mw, "status_bar"):
             if failed_count > 0:
                 mw.status_bar.showMessage(f"🧹 缓存清理完成，但有 {failed_count} 个文件正在被占用。", 4000)
             else:
                 mw.status_bar.showMessage(f"🧹 成功清空本地离线视频缓存 (共 {deleted_count} 个文件)。", 4000)
-                
-        self.btn_clear_cache.setEnabled(True) # 清理完毕，恢复按键
 
-    # ========================== 物理进度绑定槽 ==========================
+        self.btn_clear_cache.setEnabled(True)
+
     def on_video_position_changed(self, position: int):
         if not self._is_dragging_slider:
             self.progress_slider.setValue(position)
@@ -1143,28 +862,34 @@ class MenuWidget(BaseMenuWidget):
     def on_slider_moved(self, position: int):
         self.update_play_timer_label(position, self.player.duration())
 
-    # ========================== 极速合并下载流程 ==========================
     def load_video_url(self):
-        if not MULTIMEDIA_SUPPORTED: return
+        if not MULTIMEDIA_SUPPORTED:
+            return
         url_str = self.url_input.text().strip()
-        if not url_str: return
-        
+        if not url_str:
+            return
+
+        if MULTIMEDIA_SUPPORTED and hasattr(self, "player"):
+            self.player.pause()
+            self.btn_play_pause.setText("▶ 播放")
+
         if hasattr(self, "download_worker") and self.download_worker.isRunning():
             self.download_worker.progress_info.disconnect()
             self.download_worker.finished.disconnect()
             self.download_worker.error.disconnect()
-            self.download_worker.cancel()  
-            self.download_worker.wait()    
-        
+            self.download_worker.cancel()
+            self.download_worker.wait()
+
         url_hash = hashlib.sha256(url_str.encode("utf-8")).hexdigest()
         ext = ".mp4"
         if "/" in url_str:
             last_part = url_str.split("/")[-1]
             if "." in last_part:
                 possible_ext = "." + last_part.split(".")[-1]
-                if len(possible_ext) <= 5 and possible_ext.isalnum(): ext = possible_ext
+                if len(possible_ext) <= 5 and possible_ext.isalnum():
+                    ext = possible_ext
 
-        cache_dir = get_root_path() / "cache"
+        cache_dir = get_app_root() / "cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         local_cache_path = cache_dir / f"{url_hash}{ext}"
 
@@ -1176,7 +901,7 @@ class MenuWidget(BaseMenuWidget):
         self.btn_play_pause.setEnabled(False)
         self.progress_slider.setEnabled(False)
         self.time_label.setText("⏬ 缓存 0%...")
-        
+
         self.download_worker = VideoDownloadWorker(url_str, local_cache_path)
         self.download_worker.progress_info.connect(self.on_cache_progress)
         self.download_worker.finished.connect(self.on_cache_finished)
@@ -1193,17 +918,22 @@ class MenuWidget(BaseMenuWidget):
         self.btn_load_video.setEnabled(True)
         self.play_local_video(local_path_str)
         mw = self.window()
-        if mw and hasattr(mw, "status_bar"): mw.status_bar.showMessage("🎉 视频缓存下载成功！已开启离线高滑度播放。", 4000)
+        if mw and hasattr(mw, "status_bar"):
+            mw.status_bar.showMessage("🎉 视频缓存下载成功！已开启离线高滑度播放。", 4000)
 
     def on_cache_error(self, err_msg: str):
         self.btn_load_video.setEnabled(True)
         self.time_label.setText("缓存失败")
         mw = self.window()
-        if mw and hasattr(mw, "status_bar"): mw.status_bar.showMessage(f"❌ 下载故障: {err_msg}", 5000)
+        if mw and hasattr(mw, "status_bar"):
+            mw.status_bar.showMessage(f"❌ 下载故障: {err_msg}", 5000)
 
     def play_local_video(self, local_path_str: str):
         self.player.stop()
+        self.player.setVideoOutput(None)
         QApplication.processEvents()
+        self.player.setVideoOutput(self.video_widget)
+        self.video_widget.update()
         QTimer.singleShot(100, lambda: self._apply_local_video_source(local_path_str))
 
     def _apply_local_video_source(self, local_path_str: str):
@@ -1214,11 +944,14 @@ class MenuWidget(BaseMenuWidget):
             self.btn_play_pause.setText("▶ 播放")
             self.progress_slider.setEnabled(True)
             self.timeline_ticks.set_duration(self.player.duration())
+            self.video_widget.update()
             self.video_frame.setFocus()
-        except Exception: pass
+        except Exception:
+            pass
 
     def toggle_playback(self):
-        if not MULTIMEDIA_SUPPORTED: return
+        if not MULTIMEDIA_SUPPORTED:
+            return
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
             self.btn_play_pause.setText("▶ 播放")
@@ -1229,7 +962,7 @@ class MenuWidget(BaseMenuWidget):
     def update_play_timer_label(self, current_ms: int, total_ms: int):
         if hasattr(self, "download_worker") and self.download_worker.isRunning():
             return
-            
+
         def parse_ms_to_str(ms: int) -> str:
             seconds = (ms // 1000) % 60
             minutes = (ms // (1000 * 60)) % 60
@@ -1242,22 +975,29 @@ class MenuWidget(BaseMenuWidget):
         if MULTIMEDIA_SUPPORTED and hasattr(self, "player"):
             self.player.stop()
 
-    # ========================== 翻译异步控制 ==========================
     def start_online_translation(self):
         text = self.input_a.toPlainText().strip()
-        if not text: return
+        if not text:
+            return
         self.btn_online.setEnabled(False)
         self.btn_online.setText("⏳ 正在翻译中...")
-        self.btn_abort_upper.setEnabled(True)  
-        
+        self.btn_abort_upper.setEnabled(True)
+        self.engine_label.hide()
+
         engine_mode = self.get_selected_engine_key(self.combo_mode_upper)
         self.trans_worker = TranslateWorker(self.engine, text, engine_mode)
         self.trans_worker.finished.connect(self.on_online_finished)
         self.trans_worker.error.connect(self.on_online_error)
         self.trans_worker.start()
 
-    def on_online_finished(self, result_text):
+    def on_online_finished(self, result_text, engine_label="", elapsed=0.0):
         self.output_a.setPlainText(result_text)
+        if engine_label and "[双重降级失败]" not in result_text:
+            time_str = f"{elapsed:.1f}s" if elapsed > 0 else ""
+            self.engine_label.setText(f"🔧 {engine_label}  ⏱ {time_str}" if time_str else f"🔧 {engine_label}")
+            self.engine_label.show()
+        else:
+            self.engine_label.hide()
         self._reset_upper_ui()
 
     def on_online_error(self, err):
@@ -1266,11 +1006,13 @@ class MenuWidget(BaseMenuWidget):
 
     def start_offline_optimization(self):
         src_text = self.src_input.toPlainText().strip()
-        if not src_text: return
+        if not src_text:
+            return
         self.btn_offline.setEnabled(False)
         self.btn_offline.setText("⏳ 正在解析中...")
-        self.btn_abort_lower.setEnabled(True)  
-        
+        self.btn_abort_lower.setEnabled(True)
+        self.format_engine_label.hide()
+
         engine_mode = self.get_selected_engine_key(self.combo_mode_lower)
         self.format_worker = FormatWorker(self.engine, source_text=src_text, engine_mode=engine_mode)
         self.format_worker.finished.connect(self.on_offline_finished)
@@ -1281,6 +1023,15 @@ class MenuWidget(BaseMenuWidget):
         self.list_widget.clear()
         self.detail_display.clear()
         is_timeline = result_context.metadata.get("is_timeline", False)
+
+        engine_label = result_context.metadata.get("engine_used", "")
+        elapsed = result_context.metadata.get("elapsed", 0.0)
+        if engine_label and is_timeline:
+            time_str = f"{elapsed:.1f}s" if elapsed > 0 else ""
+            self.format_engine_label.setText(f"🔧 {engine_label}  ⏱ {time_str}" if time_str else f"🔧 {engine_label}")
+            self.format_engine_label.show()
+        else:
+            self.format_engine_label.hide()
         if is_timeline:
             self.processed_items = result_context.metadata.get("timeline_processed", [])
             for item in self.processed_items:
@@ -1291,7 +1042,11 @@ class MenuWidget(BaseMenuWidget):
             self.processed_items = []
             for idx, para in enumerate(result_context.processed_source_segments):
                 self.list_widget.addItem(f"para_{idx+1}")
-                self.processed_items.append({"step_id": "N/A", "segment_id": f"para_{idx+1}", "modality": "TEXT", "timestamp": "N/A", "content": para, "content_local_zh": "（暂不支持）", "bridge": "无逻辑说明", "bridge_local_zh": "（暂不支持）"})
+                self.processed_items.append({
+                    "step_id": "N/A", "segment_id": f"para_{idx+1}", "modality": "TEXT",
+                    "timestamp": "N/A", "content": para, "content_local_zh": "（暂不支持）",
+                    "bridge": "无逻辑说明", "bridge_local_zh": "（暂不支持）"
+                })
             if self.processed_items:
                 self.list_widget.setCurrentRow(0)
         self._reset_lower_ui()
@@ -1300,24 +1055,16 @@ class MenuWidget(BaseMenuWidget):
         self.detail_display.setPlainText(f"[引擎崩溃]: {err}")
         self._reset_lower_ui()
 
-    # ========================== HTML 列表单条细节渲染（100% 完整收尾） ==========================
     def display_item_detail(self, index: int):
-        """
-        选中左下方条目时，在右侧渲染精美的富文本卡片。
-        """
-        # 【必须将索引判断与 item 提取放在函数的最开头！】
         if index < 0 or index >= len(self.processed_items):
             self.detail_display.clear()
             return
         item = self.processed_items[index]
 
-        import html
-        import re
-        
-        c_text = html.escape(item['content'])
-        b_text = html.escape(item['bridge'])
-        
-        hl_path = get_root_path() / "highlight.txt"
+        c_text = html_mod.escape(item['content'])
+        b_text = html_mod.escape(item['bridge'])
+
+        hl_path = get_app_root() / "highlight.txt"
         if hl_path.exists():
             try:
                 with open(hl_path, "r", encoding="utf-8") as f:
@@ -1327,8 +1074,9 @@ class MenuWidget(BaseMenuWidget):
                     repl = lambda m: f'<span style="background-color: #15803d; color: #ffffff; padding: 0 4px; border-radius: 4px; font-weight: bold;">{m.group(0)}</span>'
                     c_text = pattern.sub(repl, c_text)
                     b_text = pattern.sub(repl, b_text)
-            except Exception: pass
-            
+            except Exception:
+                pass
+
         html_content = f"""
         <div style="line-height: 1.6; font-size: 13.5px; color: #e4e4e7; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
             <div style="border-bottom: 1px solid #27272a; padding-bottom: 4px; margin-bottom: 8px;">
