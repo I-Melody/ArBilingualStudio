@@ -223,38 +223,83 @@ class OfflineTranslator:
         err_msg = "[离线引擎未配置]"
         return [err_msg] * len(original_texts) if is_list else err_msg
 
+    def _is_hy_mt2(self):
+        return "hy-mt" in self.ollama_model.lower()
+
+    def _clean_hy_mt2_output(self, text: str) -> str:
+        for token in ["<｜hy_begin▁of▁sentence｜>", "<｜hy_User｜>", "<｜hy_Assistant｜>",
+                       "<｜hy_place▁holder▁no▁3｜>", "<｜hy_place▁holder▁no▁2｜>",
+                       "<suggested_response>", "</suggested_response>",
+                       "<ｆin｜hy-", "<ｈy-", "<ｺ｜hy-", "<ｂ｜hy-", "<｜"]:
+            text = text.replace(token, "")
+        return text.strip()
+
     def _translate_via_ollama(self, text: str, from_code: str, to_code: str) -> str:
         url = "http://localhost:11434/api/generate"
-        lang_name = "Chinese" if to_code == "zh" else "English"
-        prompt = (
-            f"### Role:\n"
-            f"You are a professional video translator translator from {from_code} to {lang_name}.\n\n"
-            f"### Strict Translation Rules:\n"
-            f"1. KEEP all proper nouns, personal names, and character names in their original English form.\n"
-            f"2. KEEP all step IDs, serial numbers, and indexes exactly in their original format.\n"
-            f"3. Translate the description and context into extremely natural, native {lang_name}.\n"
-            f"4. Output ONLY the translated text. Do not provide any explanation, quotes, or notes.\n\n"
-            f"### Actual Task Input:\n"
-            f"Input: \"{text}\"\n"
-            f"Output: "
-        )
-        data = {
-            "model": self.ollama_model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {
-                "temperature": getattr(self, "ollama_temp", 0.1)
+
+        if self._is_hy_mt2():
+            src_label = {"en": "English", "zh": "Chinese"}.get(from_code, from_code)
+            tgt_label = {"en": "English", "zh": "Chinese"}.get(to_code, to_code)
+            prompt = f"<｜hy_begin▁of▁sentence｜><｜hy_User｜>Translate from {src_label} to {tgt_label}: {text}<｜hy_Assistant｜>"
+            data = {
+                "model": self.ollama_model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": getattr(self, "ollama_temp", 0.7),
+                    "top_p": 0.6,
+                    "top_k": 20,
+                    "repeat_penalty": 1.05,
+                    "num_predict": 4096,
+                    "stop": [
+                        "<｜", "<suggested_response", "</suggested_response",
+                        "<ｆin｜hy-", "<ｈy-", "<ｺ｜hy-", "<ｂ｜hy-"
+                    ]
+                }
             }
-        }
+        else:
+            lang_name = "Chinese" if to_code == "zh" else "English"
+            prompt = (
+                f"### Role:\n"
+                f"You are a professional video translator translator from {from_code} to {lang_name}.\n\n"
+                f"### Strict Translation Rules:\n"
+                f"1. KEEP all proper nouns, personal names, and character names in their original English form.\n"
+                f"2. KEEP all step IDs, serial numbers, and indexes exactly in their original format.\n"
+                f"3. Translate the description and context into extremely natural, native {lang_name}.\n"
+                f"4. Output ONLY the translated text. Do not provide any explanation, quotes, or notes.\n\n"
+                f"### Actual Task Input:\n"
+                f"Input: \"{text}\"\n"
+                f"Output: "
+            )
+            data = {
+                "model": self.ollama_model,
+                "prompt": prompt,
+                "stream": False,
+                "enable_thinking": False,
+                "options": {
+                    "temperature": getattr(self, "ollama_temp", 0.1)
+                }
+            }
+
         try:
             res_data = make_local_request(url, data_dict=data, timeout=12)
             res = json.loads(res_data)
-            return res.get("response", "").strip()
+            result = res.get("response", "").strip()
+            if self._is_hy_mt2():
+                result = self._clean_hy_mt2_output(result)
+            return result
         except Exception as e:
             raise e
 
     def _translate_batch_via_ollama(self, texts: list[str], from_code: str, to_code: str) -> list[str]:
         url = "http://localhost:11434/api/generate"
+
+        if self._is_hy_mt2():
+            results = []
+            for t in texts:
+                results.append(self._translate_via_ollama(t.strip() if t.strip() else t, from_code, to_code))
+            return results
+
         lang_name = "Chinese" if to_code == "zh" else "English"
 
         input_dict = {f"k_{i}": t for i, t in enumerate(texts)}
@@ -278,6 +323,7 @@ class OfflineTranslator:
             "model": self.ollama_model,
             "prompt": prompt,
             "stream": False,
+            "enable_thinking": False,
             "options": {
                 "temperature": getattr(self, "ollama_temp", 0.1)
             }

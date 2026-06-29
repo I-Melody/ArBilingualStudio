@@ -3,7 +3,7 @@ import sys
 import importlib
 from PyQt6.QtCore import Qt, QPoint, QRect, QSettings, QDate
 from PyQt6.QtWidgets import (
-    QMainWindow, QTabWidget, QWidget, QVBoxLayout, QStatusBar
+    QMainWindow, QTabWidget, QWidget, QVBoxLayout, QStatusBar, QSizeGrip
 )
 from core.paths import get_app_root
 from core.clipboard_monitor import ClipboardMonitor
@@ -25,6 +25,11 @@ class MainWindow(QMainWindow):
         self.engine = RuleEngine()
         self.active_menus = {}
         self.clipboard_monitor = ClipboardMonitor(parent=self)
+
+        self._maximized = False
+        self._resize_edges = 0
+        self._drag_start_global = QPoint()
+        self._drag_start_geometry = QRect()
 
         self.init_ui()
         self.init_hot_reload()
@@ -57,6 +62,12 @@ class MainWindow(QMainWindow):
         self.status_bar.setObjectName("CustomStatusBar")
         self.setStatusBar(self.status_bar)
 
+        size_grip = QSizeGrip(self)
+        size_grip.setFixedSize(16, 16)
+        size_grip.setStyleSheet(
+            "QSizeGrip { background: transparent; }")
+        self.status_bar.addPermanentWidget(size_grip)
+
         self.load_all_menus()
 
     def load_all_menus(self):
@@ -74,7 +85,7 @@ class MainWindow(QMainWindow):
 
             title_map = {
                 "menu1": "双语处理中心",
-                "menu2": "历史记录中心",
+                "menu2": "双模翻译工作流",
                 "menu3": "规则配置控制"
             }
             tab_title = title_map.get(module_name, module_name.capitalize())
@@ -104,11 +115,25 @@ class MainWindow(QMainWindow):
         self.reload_manager.module_changed.connect(self.load_tab_module)
 
     def restore_saved_geometry(self):
+        screen = self.screen()
+        if screen is None:
+            self.resize(1180, 960)
+            return
+
         saved_geom = self.settings.value("geometry")
-        if saved_geom:
+        screen_geom = screen.availableGeometry()
+        was_maximized = self.settings.value("maximized", False, type=bool)
+
+        if was_maximized:
+            self.setGeometry(screen_geom)
+            self._maximized = True
+            self.title_bar._update_max_button_text()
+        elif saved_geom:
             self.restoreGeometry(saved_geom)
+            self._maximized = False
         else:
             self.resize(1180, 960)
+            self._maximized = False
 
     def perform_daily_cache_cleanup(self):
         try:
@@ -137,6 +162,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue("maximized", self._maximized)
         super().closeEvent(event)
 
     def _get_resize_edges(self, local_pos: QPoint):
@@ -157,31 +183,56 @@ class MainWindow(QMainWindow):
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             pos = event.position().toPoint()
-            edges = self._get_resize_edges(pos)
-            if edges:
-                wh = self.windowHandle()
-                if wh is not None:
-                    wh.startSystemResize(edges)
-                    event.accept()
-                    return
+            self._resize_edges = self._get_resize_edges(pos)
+            if self._resize_edges:
+                if self._maximized:
+                    self._maximized = False
+                    self.showNormal()
+                self._drag_start_global = event.globalPosition().toPoint()
+                self._drag_start_geometry = QRect(self.geometry())
+                event.accept()
+                return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        pos = event.position().toPoint()
-        edges = self._get_resize_edges(pos)
+        if self._resize_edges:
+            delta = event.globalPosition().toPoint() - self._drag_start_global
+            g = QRect(self._drag_start_geometry)
+            min_w = self.minimumWidth()
+            min_h = self.minimumHeight()
 
-        if edges == (Qt.Edge.LeftEdge | Qt.Edge.TopEdge) or edges == (Qt.Edge.RightEdge | Qt.Edge.BottomEdge):
-            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
-        elif edges == (Qt.Edge.RightEdge | Qt.Edge.TopEdge) or edges == (Qt.Edge.LeftEdge | Qt.Edge.BottomEdge):
-            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
-        elif edges & (Qt.Edge.LeftEdge | Qt.Edge.RightEdge):
-            self.setCursor(Qt.CursorShape.SizeHorCursor)
-        elif edges & (Qt.Edge.TopEdge | Qt.Edge.BottomEdge):
-            self.setCursor(Qt.CursorShape.SizeVerCursor)
+            if self._resize_edges & Qt.Edge.LeftEdge:
+                new_left = g.left() + delta.x()
+                if new_left > g.right() - min_w:
+                    new_left = g.right() - min_w
+                g.setLeft(new_left)
+            if self._resize_edges & Qt.Edge.TopEdge:
+                new_top = g.top() + delta.y()
+                if new_top > g.bottom() - min_h:
+                    new_top = g.bottom() - min_h
+                g.setTop(new_top)
+            if self._resize_edges & Qt.Edge.RightEdge:
+                g.setRight(max(g.right() + delta.x(), g.left() + min_w))
+            if self._resize_edges & Qt.Edge.BottomEdge:
+                g.setBottom(max(g.bottom() + delta.y(), g.top() + min_h))
+
+            self.setGeometry(g)
         else:
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+            pos = event.position().toPoint()
+            edges = self._get_resize_edges(pos)
+            if edges == (Qt.Edge.LeftEdge | Qt.Edge.TopEdge) or edges == (Qt.Edge.RightEdge | Qt.Edge.BottomEdge):
+                self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+            elif edges == (Qt.Edge.RightEdge | Qt.Edge.TopEdge) or edges == (Qt.Edge.LeftEdge | Qt.Edge.BottomEdge):
+                self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+            elif edges & (Qt.Edge.LeftEdge | Qt.Edge.RightEdge):
+                self.setCursor(Qt.CursorShape.SizeHorCursor)
+            elif edges & (Qt.Edge.TopEdge | Qt.Edge.BottomEdge):
+                self.setCursor(Qt.CursorShape.SizeVerCursor)
+            else:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
         event.accept()
 
     def mouseReleaseEvent(self, event):
+        self._resize_edges = 0
         self.setCursor(Qt.CursorShape.ArrowCursor)
         event.accept()

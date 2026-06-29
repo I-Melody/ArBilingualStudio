@@ -13,6 +13,12 @@ class CustomTitleBar(QWidget):
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.init_ui()
 
+    def _update_max_button_text(self):
+        if self.parent_window._maximized:
+            self.btn_max.setText("❐")
+        else:
+            self.btn_max.setText("⛶")
+
     def init_ui(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(15, 0, 10, 0)
@@ -63,19 +69,21 @@ class CustomTitleBar(QWidget):
         layout.addWidget(self.btn_close)
 
     def toggle_maximize(self):
-        if self.parent_window.isMaximized():
+        if self.parent_window._maximized:
             self.parent_window.showNormal()
-            QTimer.singleShot(50, lambda: self.btn_max.setText("⛶"))
+            self.parent_window._maximized = False
+            QTimer.singleShot(50, self._update_max_button_text)
         else:
             self.parent_window.showMaximized()
-            QTimer.singleShot(50, lambda: self.btn_max.setText("❐"))
+            self.parent_window._maximized = True
+            QTimer.singleShot(50, self._update_max_button_text)
 
     def enterEvent(self, event):
         self.setCursor(Qt.CursorShape.ArrowCursor)
         super().enterEvent(event)
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and not self.parent_window.isMaximized():
+        if event.button() == Qt.MouseButton.LeftButton and not self.parent_window._maximized:
             self._drag_pos = event.globalPosition().toPoint(
             ) - self.parent_window.frameGeometry().topLeft()
             event.accept()

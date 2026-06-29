@@ -8,7 +8,7 @@
 逻辑冲突###contradiction：
 其他###other：
 选项缺失###No option matches：
-题目异常###PASS：
-多选错误###Multiple options are correct：
+题目异常###PASS（Invalid question）：
+多选错误###PASS（Multiple options are correct）：
 视频异常###PASS：The video cannot be played
-理由错误###Reasoning error：
+方位###[object, left]

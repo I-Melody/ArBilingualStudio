@@ -2,6 +2,7 @@
 import sys
 import os
 os.environ['QT_MULTIMEDIA_PREFERRED_PLUGINS'] = 'windowsmediafoundation'
+os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--disable-logging --log-level=3'
 
 from PyQt6.QtWidgets import QApplication
 from core.paths import get_app_root
@@ -47,6 +48,10 @@ setup_error_handling()
 
 
 def main():
+    try:
+        import PyQt6.QtWebEngineWidgets
+    except ImportError:
+        pass
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
