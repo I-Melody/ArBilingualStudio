@@ -54,10 +54,26 @@ def _install_qt_message_handler():
     try:
         from PyQt6.QtCore import qInstallMessageHandler, QtMsgType
 
+        _dedup = {"last_msg": "", "last_time": 0.0}
+        import time as _time
+
         def qt_message_handler(msg_type, context, message):
             ctx_info = ""
             if context.file:
-                ctx_info = f" [{context.file}:{context.line}]"
+                ctx_info = f" [{context.file.name.split('/')[-1] if '/' in str(context.file) else str(context.file)}:{context.line}]"
+
+            is_ffmpeg = "ffmpeg" in str(context.file).lower() if context.file else False
+
+            if is_ffmpeg and msg_type in (QtMsgType.QtDebugMsg, QtMsgType.QtInfoMsg):
+                return
+
+            if is_ffmpeg and msg_type == QtMsgType.QtWarningMsg:
+                now = _time.time()
+                if message == _dedup["last_msg"] and now - _dedup["last_time"] < 2.0:
+                    return
+                _dedup["last_msg"] = message
+                _dedup["last_time"] = now
+
             full_msg = f"Qt{ctx_info}: {message}"
 
             if msg_type == QtMsgType.QtFatalMsg:

@@ -79,6 +79,18 @@ def get_last_cache_cleanup_date() -> str:
 def set_last_cache_cleanup_date(date_str: str):
     _settings.setValue("last_cache_cleanup_date", date_str)
 
+# ----- Video Playback Mode -----
+VIDEO_MODE_CACHE = "cache"
+VIDEO_MODE_STREAM = "stream"
+
+def get_video_playback_mode() -> str:
+    val = str(_settings.value("video_playback_mode", VIDEO_MODE_CACHE))
+    return val if val in (VIDEO_MODE_CACHE, VIDEO_MODE_STREAM) else VIDEO_MODE_CACHE
+
+def set_video_playback_mode(mode: str):
+    _settings.setValue("video_playback_mode", mode)
+    _log_write("video_playback_mode", mode)
+
 # ----- Raw access (for backward compat) -----
 def raw() -> QSettings:
     return _settings

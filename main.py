@@ -3,6 +3,11 @@ import sys
 import os
 os.environ['QT_MULTIMEDIA_PREFERRED_PLUGINS'] = 'windowsmediafoundation'
 os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = '--disable-logging --log-level=3'
+os.environ['QT_LOGGING_RULES'] = (
+    'qt.multimedia.ffmpeg.debug=false;'
+    'qt.multimedia.ffmpeg.info=false;'
+    'qt.multimedia.ffmpeg.verbose=false'
+)
 
 from PyQt6.QtWidgets import QApplication
 from core.paths import get_app_root

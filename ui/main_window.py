@@ -89,7 +89,8 @@ class MainWindow(QMainWindow):
             title_map = {
                 "menu1": "双语处理中心",
                 "menu2": "双模翻译工作流",
-                "menu3": "规则配置控制"
+                "menu3": "规则参考手册",
+                "menu9": "⚙️ 设置",
             }
             tab_title = title_map.get(module_name, module_name.capitalize())
 

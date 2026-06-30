@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .base_menu import BaseMenuWidget
+from core import config as app_config
 from ui.workers.translate_worker import TranslateWorker, FormatWorker
 from ui.workers.model_detect_worker import ModelDetectWorker
 from .panels.video_panel import VideoPanel
@@ -64,6 +65,9 @@ class MenuWidget(BaseMenuWidget):
         left_main_layout.setSpacing(10)
 
         self.video_panel = VideoPanel(self)
+        self.video_panel.set_stream_mode(
+            app_config.get_video_playback_mode() == app_config.VIDEO_MODE_STREAM
+        )
         self.video_panel.status_message.connect(self._show_status)
         self.video_panel.one_click_fill.connect(self._one_click_fill)
         self.video_panel.clipboard_video_loaded.connect(

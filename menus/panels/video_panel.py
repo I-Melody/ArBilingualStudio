@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.paths import get_app_root
+from core import config as app_config
 from core.error_handler import log_error, log_warning
 from ui.widgets.focus_frame import FocusFrame
 from ui.widgets.timeline_ticks import TimelineTicks
@@ -30,6 +31,7 @@ class VideoPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._is_dragging_slider = False
+        self._stream_mode = False
         self.player: QMediaPlayer | None = None
         self.audio_output = None
         self.video_widget: QVideoWidget | None = None
@@ -221,12 +223,17 @@ class VideoPanel(QWidget):
     def _on_player_error(self, error, error_string):
         if hasattr(self, "player") and self.player.source().isLocalFile():
             local_path = self.player.source().toLocalFile()
-            self.status_message.emit(f"⚠️ 视频格式内嵌解码失败，正在尝试调起系统默认外置播放器...", 4000)
+            self.status_message.emit("⚠️ 视频格式内嵌解码失败，正在尝试调起系统默认外置播放器...", 4000)
             try:
                 import os
                 os.startfile(local_path)
             except Exception as e:
                 log_warning(f"External player launch failed: {e}")
+        else:
+            self.time_label.setText("❌ 播放出错")
+            self.status_message.emit(
+                f"⚠️ 视频播放异常: {error_string}. 检查网络或切换为缓存模式重试。", 5000
+            )
 
     def _on_playback_state_changed(self, state):
         if state == QMediaPlayer.PlaybackState.PlayingState:
@@ -280,6 +287,10 @@ class VideoPanel(QWidget):
             return
         url_str = self.url_input.text().strip()
         if not url_str:
+            return
+
+        if app_config.get_video_playback_mode() == app_config.VIDEO_MODE_STREAM:
+            self._play_stream_url(url_str)
             return
 
         if self.player:
@@ -416,6 +427,35 @@ class VideoPanel(QWidget):
             self.timestamp_input.clearFocus()
         except Exception:
             pass  # Invalid timestamp format, silently ignore
+
+    def set_stream_mode(self, enabled: bool = True):
+        self._stream_mode = enabled
+        self.btn_clear_cache.setVisible(not enabled)
+
+    def _play_stream_url(self, url_str: str):
+        """Play video directly from URL without caching (streaming mode)."""
+        if self.player:
+            self.player.stop()
+            self.player.setVideoOutput(None)
+        QApplication.processEvents()
+        self.btn_play_pause.setEnabled(True)
+        self.btn_popup_play.setEnabled(True)
+        self.progress_slider.setEnabled(True)
+        self.time_label.setText("🌐 直链播放中...")
+        try:
+            self.player.setSource(QUrl(url_str))
+            self.player.setVideoOutput(self.video_widget)
+            self.video_widget.update()
+            self.frame.setFocus()
+            dur = self.player.duration()
+            if dur > 0:
+                self.timeline_ticks.set_duration(dur)
+        except Exception as e:
+            log_error(f"Stream play setup failed: {e}")
+            self.time_label.setText("❌ 直链播放失败")
+            self.status_message.emit(
+                "❌ 直链流播放失败，请检查网络连接或尝试切换为缓存模式。", 5000
+            )
 
     def open_external_video_window(self):
         if not MULTIMEDIA_SUPPORTED or not self.player or not self.player.source().isValid():
