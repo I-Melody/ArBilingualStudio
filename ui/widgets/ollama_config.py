@@ -3,12 +3,12 @@ import json
 import urllib.request
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QLabel, QComboBox, QPushButton
+from core import config as app_config
 
 
 class OllamaConfigWidget(QWidget):
     def __init__(self, settings=None, parent=None):
         super().__init__(parent)
-        self._settings = settings
         self.setObjectName("ConfigFrame")
 
         layout = QHBoxLayout(self)
@@ -39,13 +39,12 @@ class OllamaConfigWidget(QWidget):
         layout.addStretch()
 
     def load_saved_settings(self):
-        if self._settings:
-            saved_model = self._settings.value("ollama_model", "")
-            saved_temp = self._settings.value("ollama_temp", "0.1")
-            for i in range(self.combo_ollama_temp.count()):
-                if saved_temp in self.combo_ollama_temp.itemText(i):
-                    self.combo_ollama_temp.setCurrentIndex(i)
-                    break
+        saved_model = app_config.get_ollama_model()
+        saved_temp = str(app_config.get_ollama_temp())
+        for i in range(self.combo_ollama_temp.count()):
+            if saved_temp in self.combo_ollama_temp.itemText(i):
+                self.combo_ollama_temp.setCurrentIndex(i)
+                break
 
     def scan_local_ollama_tags(self):
         self.btn_refresh.setEnabled(False)
@@ -73,11 +72,10 @@ class OllamaConfigWidget(QWidget):
         self.combo_ollama_model.clear()
         if models_found:
             self.combo_ollama_model.addItems(models_found)
-            if self._settings:
-                saved_model = self._settings.value("ollama_model", "")
-                idx = self.combo_ollama_model.findText(saved_model)
-                if idx != -1:
-                    self.combo_ollama_model.setCurrentIndex(idx)
+            saved_model = app_config.get_ollama_model()
+            idx = self.combo_ollama_model.findText(saved_model)
+            if idx != -1:
+                self.combo_ollama_model.setCurrentIndex(idx)
         else:
             self.combo_ollama_model.addItem("⚠️ 未检测到运行中的Ollama服务")
         self.combo_ollama_model.blockSignals(False)
@@ -86,8 +84,6 @@ class OllamaConfigWidget(QWidget):
         self.btn_refresh.setText("🔄 扫描可用模型")
 
     def _on_config_changed(self):
-        if not self._settings:
-            return
         current_model = self.combo_ollama_model.currentText()
         if "未检测到" in current_model or not current_model:
             return
@@ -97,5 +93,5 @@ class OllamaConfigWidget(QWidget):
             temp_val = temp_text.split(" ")[0]
         except Exception:
             pass
-        self._settings.setValue("ollama_model", current_model)
-        self._settings.setValue("ollama_temp", temp_val)
+        app_config.set_ollama_model(current_model)
+        app_config.set_ollama_temp(float(temp_val))

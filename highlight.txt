@@ -1,5 +1,10 @@
-left
-right
 above
 below
-he
+behind
+bottom
+center
+down
+front
+left
+right
+top

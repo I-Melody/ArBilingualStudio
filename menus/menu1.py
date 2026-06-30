@@ -1,69 +1,26 @@
 # -*- coding: utf-8 -*-
-import hashlib
-import html as html_mod
-import re
-from pathlib import Path
-
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QVBoxLayout, QHBoxLayout, QTextEdit, QTextBrowser, QPushButton,
-    QLabel, QFrame, QListWidget, QWidget, QLineEdit, QSlider,
-    QScrollArea, QGridLayout, QApplication, QComboBox
+    QVBoxLayout, QHBoxLayout, QWidget,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl, QTimer, QEvent
-from PyQt6.QtGui import QPainter, QColor, QPen
 
 from .base_menu import BaseMenuWidget
-from engine.rule_engine import RuleContext
-from core.paths import get_app_root
-
-from ui.widgets.focus_frame import FocusFrame
-from ui.widgets.capsule_button import CapsuleButton
-from ui.widgets.timeline_ticks import TimelineTicks
-from ui.widgets.video_player import ExternalVideoWindow
-from ui.workers.download_worker import VideoDownloadWorker
 from ui.workers.translate_worker import TranslateWorker, FormatWorker
 from ui.workers.model_detect_worker import ModelDetectWorker
-
-try:
-    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
-    from PyQt6.QtMultimediaWidgets import QVideoWidget
-    MULTIMEDIA_SUPPORTED = True
-except ImportError:
-    MULTIMEDIA_SUPPORTED = False
+from .panels.video_panel import VideoPanel
+from .panels.phrase_panel import PhrasePanel
+from .panels.translation_panel import TranslationPanel
+from .panels.timeline_panel import TimelinePanel
 
 
 class MenuWidget(BaseMenuWidget):
-    def open_external_video_window(self):
-        if not MULTIMEDIA_SUPPORTED or not hasattr(self, "player") or not self.player.source().isValid():
-            return
-
-        pos = self.player.position()
-        self.player.pause()
-
-        if hasattr(self, "popup_window") and self.popup_window:
-            self.popup_window.close()
-
-        self.popup_window = ExternalVideoWindow(self.player, self)
-        self.popup_window.show()
-
-        self.player.setPosition(pos)
-        self.player.play()
-        self.btn_play_pause.setText("⏸ 暂停")
-
-    def restore_video_to_embedded(self):
-        if not MULTIMEDIA_SUPPORTED or not hasattr(self, "player"):
-            return
-
-        pos = self.player.position()
-        self.player.pause()
-
-        self.player.setVideoOutput(self.video_widget)
-        self.player.setPosition(pos)
-        self.player.play()
-        self.btn_play_pause.setText("⏸ 暂停")
-        self.popup_window = None
-
     def init_ui(self):
+        self._setup_stylesheet()
+        self._create_panels()
+        self._setup_comboboxes()
+        self._connect_signals()
+
+    def _setup_stylesheet(self):
         self.setStyleSheet("""
             QFrame#SectionFrame, QFrame#VideoFrame, QFrame#SubLeftFrame { background-color: #161619; border: 1px solid #27272a; border-radius: 8px; padding: 10px; }
             QFrame#VideoFrame:focus { border: 1px solid #3b82f6; }
@@ -96,7 +53,7 @@ class MenuWidget(BaseMenuWidget):
             QListWidget::item:selected { background-color: #1e3a8a; color: #60a5fa; font-weight: bold; border: 1px solid #3b82f6; }
         """)
 
-        self._is_dragging_slider = False
+    def _create_panels(self):
         main_horizontal_layout = QHBoxLayout(self)
         main_horizontal_layout.setContentsMargins(6, 6, 6, 6)
         main_horizontal_layout.setSpacing(10)
@@ -106,160 +63,18 @@ class MenuWidget(BaseMenuWidget):
         left_main_layout.setContentsMargins(0, 0, 0, 0)
         left_main_layout.setSpacing(10)
 
-        self.video_frame = FocusFrame(self)
-        self.video_frame.setObjectName("VideoFrame")
-        video_layout = QVBoxLayout(self.video_frame)
-        video_layout.setContentsMargins(8, 8, 8, 8)
-        video_layout.setSpacing(8)
-        video_layout.addWidget(QLabel("📹 视频播放控制", self, objectName="SectionHeader"))
+        self.video_panel = VideoPanel(self)
+        self.video_panel.status_message.connect(self._show_status)
+        self.video_panel.one_click_fill.connect(self._one_click_fill)
+        self.video_panel.clipboard_video_loaded.connect(
+            lambda t: self._show_status("🎬 成功从剪切板载入视频！", 3000)
+        )
+        left_main_layout.addWidget(self.video_panel, stretch=3)
 
-        url_layout = QHBoxLayout()
-        url_layout.setSpacing(6)
-        self.url_input = QLineEdit(self)
-        self.url_input.setObjectName("UrlInput")
-        self.url_input.setPlaceholderText("在此输入在线MP4视频URL链接...")
-        self.url_input.setText("https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4")
-        self.url_input.setCursor(Qt.CursorShape.IBeamCursor)
-        url_layout.addWidget(self.url_input)
+        self.phrase_panel = PhrasePanel(self)
+        self.phrase_panel.phrase_copied.connect(self._on_phrase_copied)
+        left_main_layout.addWidget(self.phrase_panel, stretch=2)
 
-        self.btn_load_video = QPushButton("加载", self)
-        self.btn_load_video.setObjectName("PlayerBtn")
-        self.btn_load_video.setFixedWidth(50)
-        self.btn_load_video.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_load_video.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_load_video.clicked.connect(self.load_video_url)
-        url_layout.addWidget(self.btn_load_video)
-
-        self.btn_clear_cache = QPushButton("清空缓存", self)
-        self.btn_clear_cache.setObjectName("PlayerBtn")
-        self.btn_clear_cache.setFixedWidth(65)
-        self.btn_clear_cache.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_clear_cache.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_clear_cache.clicked.connect(self.clear_local_cache)
-        url_layout.addWidget(self.btn_clear_cache)
-
-        self.btn_clip_video = QPushButton("📋 剪切板", self)
-        self.btn_clip_video.setObjectName("ClipBtn")
-        self.btn_clip_video.setFixedWidth(75)
-        self.btn_clip_video.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_clip_video.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_clip_video.clicked.connect(self.load_video_from_clipboard)
-        url_layout.addWidget(self.btn_clip_video)
-
-        self.btn_fill_all = QPushButton("⚡ 一键填充", self)
-        self.btn_fill_all.setObjectName("ClipBtn")
-        self.btn_fill_all.setFixedWidth(85)
-        self.btn_fill_all.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_fill_all.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_fill_all.clicked.connect(self.one_click_fill)
-        url_layout.addWidget(self.btn_fill_all)
-        video_layout.addLayout(url_layout)
-
-        self.video_canvas_container = QWidget(self)
-        self.video_canvas_layout = QVBoxLayout(self.video_canvas_container)
-        self.video_canvas_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.control_bar = QWidget(self)
-        control_bar_layout = QVBoxLayout(self.control_bar)
-        control_bar_layout.setContentsMargins(0, 0, 0, 0)
-        control_bar_layout.setSpacing(4)
-
-        self.progress_slider = QSlider(Qt.Orientation.Horizontal, self)
-        self.progress_slider.setEnabled(False)
-        self.progress_slider.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.progress_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        control_bar_layout.addWidget(self.progress_slider)
-
-        self.timeline_ticks = TimelineTicks(self)
-        control_bar_layout.addWidget(self.timeline_ticks)
-
-        buttons_row = QWidget(self)
-        buttons_layout = QHBoxLayout(buttons_row)
-        buttons_layout.setContentsMargins(0, 4, 0, 0)
-        buttons_layout.setSpacing(6)
-
-        self.btn_play_pause = QPushButton("▶ 播放", self)
-        self.btn_play_pause.setObjectName("PlayerBtn")
-        self.btn_play_pause.setFixedWidth(65)
-        self.btn_play_pause.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_play_pause.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_play_pause.clicked.connect(self.toggle_playback)
-        self.btn_play_pause.setEnabled(False)
-        buttons_layout.addWidget(self.btn_play_pause)
-
-        self.btn_popup_play = QPushButton("🔲 窗口播放", self)
-        self.btn_popup_play.setObjectName("PlayerBtn")
-        self.btn_popup_play.setFixedWidth(85)
-        self.btn_popup_play.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_popup_play.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_popup_play.clicked.connect(self.open_external_video_window)
-        self.btn_popup_play.setEnabled(False)
-        buttons_layout.addWidget(self.btn_popup_play)
-
-        buttons_layout.addStretch()
-
-        self.time_label = QLabel("00:00 / 00:00", self)
-        self.time_label.setStyleSheet("color: #a1a1aa; font-family: monospace; font-size: 11px;")
-        buttons_layout.addWidget(self.time_label)
-
-        self.lbl_volume = QLabel("🔊", self)
-        self.lbl_volume.setStyleSheet("font-size: 11px;")
-        buttons_layout.addWidget(self.lbl_volume)
-
-        self.volume_slider = QSlider(Qt.Orientation.Horizontal, self)
-        self.volume_slider.setRange(0, 100)
-        self.volume_slider.setValue(70)
-        self.volume_slider.setFixedWidth(60)
-        self.volume_slider.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.volume_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.volume_slider.valueChanged.connect(self.on_volume_changed)
-        buttons_layout.addWidget(self.volume_slider)
-
-        self.timestamp_input = QLineEdit(self)
-        self.timestamp_input.setPlaceholderText("00:00")
-        self.timestamp_input.setStyleSheet("QLineEdit { background-color: #121214; color: #e4e4e7; border: 1px solid #27272a; border-radius: 4px; padding: 2px 4px; font-size: 10px; font-family: monospace; }")
-        self.timestamp_input.setFixedWidth(50)
-        self.timestamp_input.returnPressed.connect(self.jump_to_timestamp)
-        buttons_layout.addWidget(self.timestamp_input)
-
-        self.btn_jump = QPushButton("跳转", self)
-        self.btn_jump.setObjectName("PlayerBtn")
-        self.btn_jump.setFixedWidth(40)
-        self.btn_jump.setFixedHeight(20)
-        self.btn_jump.setStyleSheet("font-size: 10px; padding: 0;")
-        self.btn_jump.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_jump.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_jump.clicked.connect(self.jump_to_timestamp)
-        buttons_layout.addWidget(self.btn_jump)
-
-        control_bar_layout.addWidget(buttons_row)
-        self.init_multimedia_engine()
-
-        video_layout.addWidget(self.video_canvas_container, stretch=1)
-        video_layout.addWidget(self.control_bar)
-        left_main_layout.addWidget(self.video_frame, stretch=3)
-
-        self.phrase_frame = QFrame(self)
-        self.phrase_frame.setObjectName("SubLeftFrame")
-        phrase_layout = QVBoxLayout(self.phrase_frame)
-        phrase_layout.setContentsMargins(8, 8, 8, 8)
-        phrase_layout.setSpacing(6)
-        phrase_layout.addWidget(QLabel("📋 便捷短语复制 (words.txt)", self, objectName="SectionHeader"))
-
-        scroll_area = QScrollArea(self)
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setStyleSheet("QScrollArea { border: none; background-color: transparent; } QScrollBar:vertical { border: none; background-color: #121214; width: 6px; border-radius: 3px; } QScrollBar::handle:vertical { background-color: #27272a; border-radius: 3px; }")
-
-        scroll_content = QWidget()
-        scroll_content.setStyleSheet("background-color: transparent;")
-        self.grid_layout = QGridLayout(scroll_content)
-        self.grid_layout.setContentsMargins(0, 0, 5, 0)
-        self.grid_layout.setSpacing(6)
-        self.load_words_config()
-        scroll_area.setWidget(scroll_content)
-        phrase_layout.addWidget(scroll_area)
-
-        left_main_layout.addWidget(self.phrase_frame, stretch=2)
         main_horizontal_layout.addWidget(left_main_widget, stretch=45)
 
         right_main_widget = QWidget(self)
@@ -267,850 +82,188 @@ class MenuWidget(BaseMenuWidget):
         right_main_layout.setContentsMargins(0, 0, 0, 0)
         right_main_layout.setSpacing(10)
 
-        self.upper_frame = QFrame(self)
-        self.upper_frame.setObjectName("SectionFrame")
-        upper_layout = QVBoxLayout(self.upper_frame)
-        upper_layout.setContentsMargins(8, 8, 8, 8)
-        upper_layout.setSpacing(8)
-        upper_header_layout = QHBoxLayout()
-        upper_header_layout.setContentsMargins(0, 0, 0, 0)
-        upper_header_layout.addWidget(QLabel("🗣️ 1. 在线双路并行对照翻译", self, objectName="SectionHeader"))
-        upper_header_layout.addStretch()
-        self.engine_label = QLabel("", self)
-        self.engine_label.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold; background-color: #1e1b4b; border: 1px solid #4338ca; border-radius: 6px; padding: 2px 10px;")
-        self.engine_label.hide()
-        upper_header_layout.addWidget(self.engine_label)
-        upper_layout.addLayout(upper_header_layout)
+        self.translation_panel = TranslationPanel(self)
+        self.translation_panel.translate_requested.connect(self._on_translate_requested)
+        self.translation_panel.abort_requested.connect(self._abort_translation)
+        self.translation_panel.clipboard_translate_requested.connect(self._on_clipboard_translate)
+        right_main_layout.addWidget(self.translation_panel, stretch=2)
 
-        translate_columns = QHBoxLayout()
-        translate_columns.setSpacing(8)
-        self.input_a = QTextEdit(self)
-        self.input_a.setPlaceholderText("在此输入英文原始文本段落...")
-        self.input_a.setCursor(Qt.CursorShape.IBeamCursor)
-        translate_columns.addWidget(self.input_a, stretch=45)
+        self.timeline_panel = TimelinePanel(self)
+        self.timeline_panel.format_requested.connect(self._on_format_requested)
+        self.timeline_panel.abort_requested.connect(self._abort_formatting)
+        self.timeline_panel.clipboard_format_requested.connect(self._on_clipboard_format)
+        self.timeline_panel.jump_to_timestamp.connect(self._on_jump_to_timestamp)
+        right_main_layout.addWidget(self.timeline_panel, stretch=3)
 
-        self.output_a = QTextEdit(self)
-        self.output_a.setReadOnly(True)
-        self.output_a.setPlaceholderText("等待引擎翻译对照输出...")
-        self.output_a.setCursor(Qt.CursorShape.IBeamCursor)
-        translate_columns.addWidget(self.output_a, stretch=55)
-        upper_layout.addLayout(translate_columns)
-
-        online_actions_layout = QHBoxLayout()
-        online_actions_layout.setSpacing(8)
-
-        self.combo_mode_upper = QComboBox(self)
-        self.combo_mode_upper.setMinimumWidth(210)
-        self.combo_mode_upper.setFixedHeight(34)
-        online_actions_layout.addWidget(self.combo_mode_upper)
-
-        self.btn_online = QPushButton("🚀 运行双通道翻译", self)
-        self.btn_online.setObjectName("OnlineBtn")
-        self.btn_online.setMinimumWidth(140)
-        self.btn_online.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_online.clicked.connect(self.start_online_translation)
-        online_actions_layout.addWidget(self.btn_online, stretch=3)
-
-        self.btn_abort_upper = QPushButton("⏹ 中止", self)
-        self.btn_abort_upper.setObjectName("AbortBtn")
-        self.btn_abort_upper.setFixedWidth(50)
-        self.btn_abort_upper.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_abort_upper.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_abort_upper.clicked.connect(self.abort_upper_translation)
-        self.btn_abort_upper.setEnabled(False)
-        online_actions_layout.addWidget(self.btn_abort_upper)
-
-        self.btn_clip_online = QPushButton("📋 读剪切板翻译", self)
-        self.btn_clip_online.setObjectName("ClipBtn")
-        self.btn_clip_online.setMinimumWidth(110)
-        self.btn_clip_online.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_clip_online.clicked.connect(self.translate_clipboard_online)
-        online_actions_layout.addWidget(self.btn_clip_online, stretch=1)
-        upper_layout.addLayout(online_actions_layout)
-        right_main_layout.addWidget(self.upper_frame, stretch=2)
-
-        self.lower_frame = QFrame(self)
-        self.lower_frame.setObjectName("SectionFrame")
-        lower_layout = QVBoxLayout(self.lower_frame)
-        lower_layout.setContentsMargins(8, 8, 8, 8)
-        lower_layout.setSpacing(8)
-        lower_header_layout = QHBoxLayout()
-        lower_header_layout.setContentsMargins(0, 0, 0, 0)
-        lower_header_layout.addWidget(QLabel("🧬 2. 事件节点格式优化与离线解析", self, objectName="SectionHeader"))
-        lower_header_layout.addStretch()
-        self.format_engine_label = QLabel("", self)
-        self.format_engine_label.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold; background-color: #1e1b4b; border: 1px solid #4338ca; border-radius: 6px; padding: 2px 10px;")
-        self.format_engine_label.hide()
-        lower_header_layout.addWidget(self.format_engine_label)
-        lower_layout.addLayout(lower_header_layout)
-
-        format_columns = QHBoxLayout()
-        format_columns.setSpacing(8)
-        self.src_input = QTextEdit(self)
-        self.src_input.setPlaceholderText("在此粘贴多模态分析 JSON 数组原始文本...")
-        self.src_input.setCursor(Qt.CursorShape.IBeamCursor)
-        format_columns.addWidget(self.src_input, stretch=45)
-
-        right_container = QWidget()
-        right_layout = QVBoxLayout(right_container)
-        right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(6)
-
-        self.list_widget = QListWidget(self)
-        self.list_widget.setFlow(QListWidget.Flow.LeftToRight)
-        self.list_widget.setFixedHeight(36)
-        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.list_widget.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.list_widget.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.list_widget.currentRowChanged.connect(self.display_item_detail)
-        right_layout.addWidget(self.list_widget)
-
-        self.detail_display = QTextBrowser(self)
-        self.detail_display.setCursor(Qt.CursorShape.ArrowCursor)
-        self.detail_display.setOpenLinks(False)
-        self.detail_display.anchorClicked.connect(self.handle_anchor_clicked)
-        right_layout.addWidget(self.detail_display)
-
-        format_columns.addWidget(right_container, stretch=55)
-        lower_layout.addLayout(format_columns)
-
-        offline_actions_layout = QHBoxLayout()
-        offline_actions_layout.setSpacing(8)
-
-        self.combo_mode_lower = QComboBox(self)
-        self.combo_mode_lower.setMinimumWidth(210)
-        self.combo_mode_lower.setFixedHeight(34)
-        offline_actions_layout.addWidget(self.combo_mode_lower)
-
-        self.btn_offline = QPushButton("⚡ 执行格式整理与解析", self)
-        self.btn_offline.setObjectName("OfflineBtn")
-        self.btn_offline.setMinimumWidth(140)
-        self.btn_offline.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_offline.clicked.connect(self.start_offline_optimization)
-        offline_actions_layout.addWidget(self.btn_offline, stretch=3)
-
-        self.btn_abort_lower = QPushButton("⏹ 中止", self)
-        self.btn_abort_lower.setObjectName("AbortBtn")
-        self.btn_abort_lower.setFixedWidth(50)
-        self.btn_abort_lower.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_abort_lower.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.btn_abort_lower.clicked.connect(self.abort_lower_formatting)
-        self.btn_abort_lower.setEnabled(False)
-        offline_actions_layout.addWidget(self.btn_abort_lower)
-
-        self.btn_clip_offline = QPushButton("📋 读剪切板解析", self)
-        self.btn_clip_offline.setObjectName("ClipBtn")
-        self.btn_clip_offline.setMinimumWidth(110)
-        self.btn_clip_offline.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_clip_offline.clicked.connect(self.format_clipboard_offline)
-        offline_actions_layout.addWidget(self.btn_clip_offline, stretch=1)
-
-        lower_layout.addLayout(offline_actions_layout)
-        right_main_layout.addWidget(self.lower_frame, stretch=3)
         main_horizontal_layout.addWidget(right_main_widget, stretch=55)
-        self.processed_items = []
 
-        self.update_engine_combobox_labels()
+        self.trans_worker = None
+        self.format_worker = None
 
-    def update_engine_combobox_labels(self):
-        routing_items = [
-            "☁️ 在线优先 (自动降级)",
-            "💻 本地优先 (自动降级)"
-        ]
-        self.combo_mode_upper.clear()
-        self.combo_mode_upper.addItems(routing_items)
-        self.combo_mode_lower.clear()
-        self.combo_mode_lower.addItems(routing_items)
+    def _connect_signals(self):
+        pass
+
+    def _setup_comboboxes(self):
+        routing_items = ["☁️ 在线优先 (自动降级)", "💻 本地优先 (自动降级)"]
+
+        for combo in [self.translation_panel.combo_mode, self.timeline_panel.combo_mode]:
+            combo.clear()
+            combo.addItems(routing_items)
 
         self.detect_worker = ModelDetectWorker(self)
         self.detect_worker.finished_detect.connect(self._apply_detected_models)
         self.detect_worker.start()
 
     def _apply_detected_models(self, offline_items):
-        self.combo_mode_upper.addItems(offline_items)
-        self.combo_mode_lower.addItems(offline_items)
+        for combo in [self.translation_panel.combo_mode, self.timeline_panel.combo_mode]:
+            combo.addItems(offline_items)
+            ollama_text = "🤖 Ollama (本地大模型)"
+            idx = combo.findText(ollama_text)
+            if idx != -1:
+                combo.setCurrentIndex(idx)
 
-        ollama_text = "🤖 Ollama (本地大模型)"
-        idx = self.combo_mode_upper.findText(ollama_text)
-        if idx != -1:
-            self.combo_mode_upper.setCurrentIndex(idx)
-            self.combo_mode_lower.setCurrentIndex(idx)
+    def _show_status(self, message: str, timeout: int = 3000):
+        mw = self.window()
+        if mw and hasattr(mw, "status_bar"):
+            mw.status_bar.showMessage(message, timeout)
 
-    def get_selected_engine_key(self, combobox: QComboBox) -> str:
-        text = combobox.currentText()
-        if "在线优先" in text:
-            return "online_first"
-        elif "本地优先" in text:
-            return "local_first"
-        elif "Ollama" in text:
-            return "ollama"
-        elif "MarianMT" in text:
-            return "transformers"
-        elif "Argos" in text:
-            return "argos"
-        return "online_first"
-
-    def abort_upper_translation(self):
-        if hasattr(self, "trans_worker") and self.trans_worker.isRunning():
-            self.trans_worker.terminate()
-            self.trans_worker.wait()
-            self.engine_label.hide()
-            self._reset_upper_ui()
-            mw = self.window()
-            if mw and hasattr(mw, "status_bar"):
-                mw.status_bar.showMessage("⏹ 在线翻译任务已由用户强行中止。", 3000)
-
-    def _reset_upper_ui(self):
-        self.btn_online.setEnabled(True)
-        self.btn_online.setText("🚀 运行双通道翻译")
-        self.btn_abort_upper.setEnabled(False)
-
-    def abort_lower_formatting(self):
-        if hasattr(self, "format_worker") and self.format_worker.isRunning():
-            self.format_worker.terminate()
-            self.format_worker.wait()
-            self.format_engine_label.hide()
-            self._reset_lower_ui()
-            mw = self.window()
-            if mw and hasattr(mw, "status_bar"):
-                mw.status_bar.showMessage("⏹ 离线格式化解析任务已由用户强行中止。", 3000)
-
-    def _reset_lower_ui(self):
-        self.btn_offline.setEnabled(True)
-        self.btn_offline.setText("⚡ 执行格式整理与解析")
-        self.btn_abort_lower.setEnabled(False)
-
-    def load_words_config(self):
-        words_path = get_app_root() / "words.txt"
-        phrases = []
-        if words_path.exists():
-            try:
-                with open(words_path, "r", encoding="utf-8") as f:
-                    phrases = [line.strip() for line in f if line.strip()]
-            except Exception:
-                pass
-        else:
-            phrases = [
-                "在线大雄兔###https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
-                "在线玩具世界###https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
-                "极佳编辑###Brilliant editing",
-                "一键加速###Hurry up",
-                "Check this",
-                "Behind scenes"
-            ]
-            try:
-                with open(words_path, "w", encoding="utf-8") as f:
-                    f.write("\n".join(phrases))
-            except Exception:
-                pass
-
-        cols = 2
-        for idx, text in enumerate(phrases):
-            row = idx // cols
-            col = idx % cols
-            if "###" in text:
-                parts = text.split("###", 1)
-                title_part = parts[0].strip()
-                copy_part = parts[1].strip()
-
-                cell_widget = QWidget(self)
-                cell_layout = QHBoxLayout(cell_widget)
-                cell_layout.setContentsMargins(0, 0, 0, 0)
-                cell_layout.setSpacing(4)
-
-                title_lbl = QLabel(title_part, self)
-                title_lbl.setStyleSheet("color: #71717a; font-size: 11px; font-weight: bold;")
-
-                btn = CapsuleButton(copy_part, self)
-                btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-                btn.clicked.connect(lambda checked, t=copy_part: self.copy_phrase_to_clipboard(t))
-
-                cell_layout.addWidget(title_lbl)
-                cell_layout.addWidget(btn, stretch=1)
-                self.grid_layout.addWidget(cell_widget, row, col)
-            else:
-                btn = CapsuleButton(text, self)
-                btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-                btn.clicked.connect(lambda checked, t=text: self.copy_phrase_to_clipboard(t))
-                self.grid_layout.addWidget(btn, row, col)
-
-    def copy_phrase_to_clipboard(self, text: str):
-        clipboard = QApplication.clipboard()
+    def _on_phrase_copied(self, text: str):
         mw = self.window()
         if mw and hasattr(mw, "clipboard_monitor"):
             mw.clipboard_monitor.mark_written(text)
-        clipboard.setText(text)
-        if mw and hasattr(mw, "status_bar"):
-            mw.status_bar.showMessage(f"📋 短语已成功复制到剪切板: \"{text}\"", 2000)
+        self._show_status(f"📋 短语已成功复制到剪切板: \"{text}\"", 2000)
 
-    def init_multimedia_engine(self):
-        if not MULTIMEDIA_SUPPORTED:
-            warn_lbl = QLabel("⚠️ [多媒体不支持] 未检测到 PyQt6.QtMultimedia 驱动。", self)
-            warn_lbl.setStyleSheet("color: #71717a; font-size: 11px;")
-            warn_lbl.setWordWrap(True)
-            warn_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.video_canvas_layout.addWidget(warn_lbl)
-            self.control_bar.hide()
-            return
+    def _on_jump_to_timestamp(self, raw_timestamp: str):
+        self.video_panel.timestamp_input.setText(raw_timestamp)
+        self.video_panel.jump_to_timestamp()
 
-        self.player = QMediaPlayer(self)
-        try:
-            self.audio_output = QAudioOutput(self)
-            self.player.setAudioOutput(self.audio_output)
-        except Exception:
-            self.audio_output = None
+    def _on_translate_requested(self, text: str, engine_mode: str):
+        self.trans_worker = TranslateWorker(self.engine, text, engine_mode, self.translator_service)
+        self.trans_worker.finished.connect(self._on_translation_finished)
+        self.trans_worker.error.connect(self.translation_panel.show_error)
+        self.trans_worker.start()
 
-        self.video_widget = QVideoWidget(self)
-        self.video_widget.setStyleSheet("background-color: #000000; border-radius: 6px;")
-        self.video_canvas_layout.addWidget(self.video_widget)
-        self.player.setVideoOutput(self.video_widget)
+    def _on_translation_finished(self, result_text, engine_label="", elapsed=0.0):
+        self.translation_panel.show_result(result_text, engine_label, elapsed)
 
-        self.poll_timer = QTimer(self)
-        self.poll_timer.setInterval(200)
-        self.poll_timer.timeout.connect(self.poll_player_progress)
+    def _abort_translation(self):
+        if self.trans_worker and self.trans_worker.isRunning():
+            self.trans_worker.terminate()
+            self.trans_worker.wait()
+            self.translation_panel.engine_label.hide()
+            self.translation_panel.set_working(False)
+            self._show_status("⏹ 在线翻译任务已由用户强行中止。", 3000)
 
-        self.player.playbackStateChanged.connect(self.on_playback_state_changed)
-        self.player.errorOccurred.connect(self.on_player_error)
-        self.progress_slider.sliderPressed.connect(self.on_slider_pressed)
-        self.progress_slider.sliderReleased.connect(self.on_slider_released)
-        self.progress_slider.sliderMoved.connect(self.on_slider_moved)
-        self.video_widget.installEventFilter(self)
+    def _on_clipboard_translate(self, text: str):
+        self.translation_panel.input_text.setPlainText(text)
+        engine_mode = self.translation_panel.get_selected_engine_key()
+        self._on_translate_requested(text, engine_mode)
 
-    def on_player_error(self, error, error_string):
-        if hasattr(self, "player") and self.player.source().isLocalFile():
-            local_path = self.player.source().toLocalFile()
-            mw = self.window()
-            if mw and hasattr(mw, "status_bar"):
-                mw.status_bar.showMessage(f"⚠️ 视频格式内嵌解码失败，正在尝试调起系统默认外置播放器...", 4000)
-            try:
-                import os
-                os.startfile(local_path)
-            except Exception:
-                pass
+    def _on_format_requested(self, text: str, engine_mode: str):
+        self.format_worker = FormatWorker(self.engine, source_text=text, engine_mode=engine_mode,
+                                          translator_service=self.translator_service)
+        self.format_worker.finished.connect(self.timeline_panel.display_result)
+        self.format_worker.error.connect(self.timeline_panel.show_error)
+        self.format_worker.start()
 
-    def on_playback_state_changed(self, state):
-        if state == QMediaPlayer.PlaybackState.PlayingState:
-            self.poll_timer.start()
-        else:
-            self.poll_timer.stop()
+    def _abort_formatting(self):
+        if self.format_worker and self.format_worker.isRunning():
+            self.format_worker.terminate()
+            self.format_worker.wait()
+            self.timeline_panel.engine_label.hide()
+            self.timeline_panel.set_working(False)
+            self._show_status("⏹ 离线格式化解析任务已由用户强行中止。", 3000)
 
-    def poll_player_progress(self):
-        if not MULTIMEDIA_SUPPORTED or not hasattr(self, "player") or self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-            return
-        pos = self.player.position()
-        dur = self.player.duration()
-        if not self._is_dragging_slider:
-            if self.progress_slider.maximum() != dur and dur > 0:
-                self.progress_slider.setRange(0, dur)
-                self.timeline_ticks.set_duration(dur)
-            self.progress_slider.setValue(pos)
-        self.update_play_timer_label(pos, dur)
+    def _on_clipboard_format(self, text: str):
+        self.timeline_panel.src_input.setPlainText(text)
+        engine_mode = self.timeline_panel.get_selected_engine_key()
+        self._on_format_requested(text, engine_mode)
 
-    def eventFilter(self, obj, event):
-        if MULTIMEDIA_SUPPORTED and obj == self.video_widget:
-            if event.type() == QEvent.Type.MouseButtonPress:
-                self.video_frame.setFocus()
-        return super().eventFilter(obj, event)
-
-    def keyPressEvent(self, event):
-        if not MULTIMEDIA_SUPPORTED or not self.video_frame.hasFocus():
-            super().keyPressEvent(event)
-            return
-        key = event.key()
-        if key == Qt.Key.Key_Space:
-            self.toggle_playback()
-            event.accept()
-        elif key == Qt.Key.Key_Left:
-            self.seek_offset(-5000)
-            event.accept()
-        elif key == Qt.Key.Key_Right:
-            self.seek_offset(5000)
-            event.accept()
-        elif key == Qt.Key.Key_Up:
-            self.adjust_volume_offset(5)
-            event.accept()
-        elif key == Qt.Key.Key_Down:
-            self.adjust_volume_offset(-5)
-            event.accept()
-        else:
-            super().keyPressEvent(event)
-
-    def seek_offset(self, ms_offset: int):
-        new_pos = self.player.position() + ms_offset
-        duration = self.player.duration()
-        if new_pos < 0:
-            new_pos = 0
-        elif duration > 0 and new_pos > duration:
-            new_pos = duration
-        self.player.setPosition(new_pos)
-        self.progress_slider.setValue(new_pos)
-
-    def adjust_volume_offset(self, vol_offset: int):
-        current_vol = self.volume_slider.value()
-        new_vol = current_vol + vol_offset
-        if new_vol < 0:
-            new_vol = 0
-        elif new_vol > 100:
-            new_vol = 100
-        self.volume_slider.setValue(new_vol)
-
-    def load_video_from_clipboard(self):
-        if not MULTIMEDIA_SUPPORTED:
-            return
-        text = QApplication.clipboard().text().strip()
-        if text.startswith(("http://", "https://")) and any(ext in text.lower() for ext in (".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".3gp")):
-            self.url_input.setText(text)
-            self.load_video_url()
-            mw = self.window()
-            if mw and hasattr(mw, "status_bar"):
-                mw.status_bar.showMessage("🎬 成功从剪切板载入视频！", 3000)
-
-    def one_click_fill(self):
+    def _one_click_fill(self):
         mw = self.window()
         if not mw or not hasattr(mw, "clipboard_monitor"):
-            if mw and hasattr(mw, "status_bar"):
-                mw.status_bar.showMessage("📋 剪切板监听未就绪。", 3000)
+            self._show_status("📋 剪切板监听未就绪。", 3000)
             return
 
         recent = mw.clipboard_monitor.get_recent(3)
         if not recent:
-            if mw and hasattr(mw, "status_bar"):
-                mw.status_bar.showMessage("📋 剪切板历史为空，请先复制内容。", 3000)
+            self._show_status("📋 剪切板历史为空，请先复制内容。", 3000)
             return
 
         first_text = recent[0].strip() if recent else ""
         first_is_url = first_text.lower().startswith(("http://", "https://"))
+        items = recent if first_is_url else recent[:2]
 
         slots_filled = {"video": False, "translation": False, "timeline": False}
-
-        if first_is_url:
-            items = recent
-        else:
-            items = recent[:2]
 
         for text in items:
             text = text.strip()
             if not text:
                 continue
-
             is_video_url = (text.lower().startswith(("http://", "https://")) and
                            any(ext in text.lower() for ext in (".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".3gp")))
             is_json = text.startswith("[") and text.endswith("]")
 
             if is_video_url and not slots_filled["video"]:
-                self.url_input.setText(text)
-                self.load_video_url()
+                self.video_panel.url_input.setText(text)
+                self.video_panel.load_video_url()
                 slots_filled["video"] = True
             elif is_json and not slots_filled["timeline"]:
-                self.src_input.setPlainText(text)
-                self.start_offline_optimization()
+                self.timeline_panel.src_input.setPlainText(text)
+                engine_mode = self.timeline_panel.get_selected_engine_key()
+                self._on_format_requested(text, engine_mode)
                 slots_filled["timeline"] = True
             elif not slots_filled["translation"]:
-                self.input_a.setPlainText(text)
-                self.start_online_translation()
+                self.translation_panel.input_text.setPlainText(text)
+                engine_mode = self.translation_panel.get_selected_engine_key()
+                self._on_translate_requested(text, engine_mode)
                 slots_filled["translation"] = True
 
             if all(slots_filled.values()):
                 break
 
         filled = sum(1 for v in slots_filled.values() if v)
-        if mw and hasattr(mw, "status_bar"):
-            parts = []
-            if slots_filled["video"]:
-                parts.append("视频链接")
-            if slots_filled["translation"]:
-                parts.append("翻译区")
-            if slots_filled["timeline"]:
-                parts.append("时间线解析")
-            mw.status_bar.showMessage(f"🚀 一键填充完成：{', '.join(parts)} 共 {filled} 个区域。", 4000)
-
-    def translate_clipboard_online(self):
-        text = QApplication.clipboard().text().strip()
-        if text:
-            self.input_a.setPlainText(text)
-            self.start_online_translation()
-
-    def format_clipboard_offline(self):
-        text = QApplication.clipboard().text().strip()
-        if text:
-            self.src_input.setPlainText(text)
-            self.start_offline_optimization()
-
-    def on_volume_changed(self, value: int):
-        if MULTIMEDIA_SUPPORTED and hasattr(self, "audio_output"):
-            self.audio_output.setVolume(value / 100.0)
-            if value == 0:
-                self.lbl_volume.setText("🔇")
-            elif value < 40:
-                self.lbl_volume.setText("🔈")
-            else:
-                self.lbl_volume.setText("🔊")
-
-    def jump_to_timestamp(self):
-        raw_text = self.timestamp_input.text().strip()
-        if not raw_text or not MULTIMEDIA_SUPPORTED:
-            return
-        try:
-            parts = re.split(r'[:\.]', raw_text)
-            ms = 0
-
-            if len(parts) == 3:
-                total_seconds = int(parts[0]) * 60 + float(parts[1])
-                ms = int(parts[2])
-            elif len(parts) == 2:
-                total_seconds = int(parts[0]) * 60 + float(parts[1])
-            elif len(parts) == 1:
-                total_seconds = float(parts[0])
-            elif len(parts) == 4:
-                total_seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-                ms = int(parts[3])
-            else:
-                raise ValueError()
-
-            target_ms = int(total_seconds * 1000) + ms
-
-            duration = self.player.duration()
-            if target_ms < 0:
-                target_ms = 0
-            elif duration > 0 and target_ms > duration:
-                target_ms = duration
-
-            self.player.setPosition(target_ms)
-            self.progress_slider.setValue(target_ms)
-
-            self.player.play()
-            self.btn_play_pause.setText("⏸ 暂停")
-
-            self.video_frame.setFocus()
-            self.timestamp_input.clearFocus()
-        except Exception:
-            pass
-
-    def handle_anchor_clicked(self, qurl: QUrl):
-        url_str = qurl.toString()
-        if url_str.startswith("jump:"):
-            raw_timestamp = url_str.split("jump:")[1]
-            start_time = raw_timestamp.split("-")[0].strip() if "-" in raw_timestamp else raw_timestamp.strip()
-            self.timestamp_input.setText(start_time)
-            self.jump_to_timestamp()
-
-    def clear_local_cache(self):
-        self.btn_clear_cache.setEnabled(False)
-
-        if hasattr(self, "download_worker") and self.download_worker.isRunning():
-            self.download_worker.progress_info.disconnect()
-            self.download_worker.finished.disconnect()
-            self.download_worker.error.disconnect()
-            self.download_worker.cancel()
-            self.download_worker.wait()
-
-        if MULTIMEDIA_SUPPORTED and hasattr(self, "player"):
-            self.player.stop()
-            self.player.setSource(QUrl())
-        QApplication.processEvents()
-
-        cache_dir = get_app_root() / "cache"
-        deleted_count = 0
-        failed_count = 0
-        if cache_dir.exists():
-            for item in cache_dir.iterdir():
-                if item.is_file():
-                    try:
-                        item.unlink()
-                        deleted_count += 1
-                    except Exception as e:
-                        import logging
-                        logging.warning(f"缓存文件删除失败: {e}")
-                        failed_count += 1
-
-        self.btn_play_pause.setEnabled(False)
-        self.btn_popup_play.setEnabled(False)
-        self.btn_play_pause.setText("▶ 播放")
-        self.progress_slider.setValue(0)
-        self.progress_slider.setEnabled(False)
-        self.time_label.setText("00:00 / 00:00")
-        self.timeline_ticks.set_duration(0)
-
-        mw = self.window()
-        if mw and hasattr(mw, "status_bar"):
-            if failed_count > 0:
-                mw.status_bar.showMessage(f"🧹 缓存清理完成，但有 {failed_count} 个文件正在被占用。", 4000)
-            else:
-                mw.status_bar.showMessage(f"🧹 成功清空本地离线视频缓存 (共 {deleted_count} 个文件)。", 4000)
-
-        self.btn_clear_cache.setEnabled(True)
-
-    def on_video_position_changed(self, position: int):
-        if not self._is_dragging_slider:
-            self.progress_slider.setValue(position)
-        self.update_play_timer_label(position, self.player.duration())
-
-    def on_video_duration_changed(self, duration: int):
-        self.progress_slider.setRange(0, duration)
-        self.timeline_ticks.set_duration(duration)
-        self.update_play_timer_label(self.player.position(), duration)
-
-    def on_slider_pressed(self):
-        self._is_dragging_slider = True
-
-    def on_slider_released(self):
-        self._is_dragging_slider = False
-        self.player.setPosition(self.progress_slider.value())
-
-    def on_slider_moved(self, position: int):
-        self.update_play_timer_label(position, self.player.duration())
-
-    def load_video_url(self):
-        if not MULTIMEDIA_SUPPORTED:
-            return
-        url_str = self.url_input.text().strip()
-        if not url_str:
-            return
-
-        if MULTIMEDIA_SUPPORTED and hasattr(self, "player"):
-            self.player.pause()
-            self.btn_play_pause.setText("▶ 播放")
-
-        if hasattr(self, "download_worker") and self.download_worker.isRunning():
-            self.download_worker.progress_info.disconnect()
-            self.download_worker.finished.disconnect()
-            self.download_worker.error.disconnect()
-            self.download_worker.cancel()
-            self.download_worker.wait()
-
-        url_hash = hashlib.sha256(url_str.encode("utf-8")).hexdigest()
-        ext = ".mp4"
-        if "/" in url_str:
-            last_part = url_str.split("/")[-1]
-            if "." in last_part:
-                possible_ext = "." + last_part.split(".")[-1]
-                if len(possible_ext) <= 5 and possible_ext.isalnum():
-                    ext = possible_ext
-
-        cache_dir = get_app_root() / "cache"
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        local_cache_path = cache_dir / f"{url_hash}{ext}"
-
-        if local_cache_path.exists():
-            self.play_local_video(str(local_cache_path.resolve()))
-            return
-
-        self.btn_load_video.setEnabled(False)
-        self.btn_play_pause.setEnabled(False)
-        self.progress_slider.setEnabled(False)
-        self.time_label.setText("⏬ 缓存 0%...")
-
-        self.download_worker = VideoDownloadWorker(url_str, local_cache_path)
-        self.download_worker.progress_info.connect(self.on_cache_progress)
-        self.download_worker.finished.connect(self.on_cache_finished)
-        self.download_worker.error.connect(self.on_cache_error)
-        self.download_worker.start()
-
-    def on_cache_progress(self, percent: int, speed_mbs: float, total_mb: float, downloaded_mb: float = 0.0):
-        if percent >= 0:
-            self.time_label.setText(f"⏬ {percent}% ({speed_mbs:.1f}M/s) / 共 {total_mb:.1f}M")
-        else:
-            self.time_label.setText(f"⏬ {total_mb:.1f}M ({speed_mbs:.1f}M/s)")
-
-    def on_cache_finished(self, local_path_str: str):
-        self.btn_load_video.setEnabled(True)
-        self.play_local_video(local_path_str)
-        mw = self.window()
-        if mw and hasattr(mw, "status_bar"):
-            mw.status_bar.showMessage("🎉 视频缓存下载成功！已开启离线高滑度播放。", 4000)
-
-    def on_cache_error(self, err_msg: str):
-        self.btn_load_video.setEnabled(True)
-        self.time_label.setText("缓存失败")
-        mw = self.window()
-        if mw and hasattr(mw, "status_bar"):
-            mw.status_bar.showMessage(f"❌ 下载故障: {err_msg}", 5000)
-
-    def play_local_video(self, local_path_str: str):
-        self.player.stop()
-        self.player.setVideoOutput(None)
-        QApplication.processEvents()
-        self.player.setVideoOutput(self.video_widget)
-        self.video_widget.update()
-        QTimer.singleShot(100, lambda: self._apply_local_video_source(local_path_str))
-
-    def _apply_local_video_source(self, local_path_str: str):
-        try:
-            self.player.setSource(QUrl.fromLocalFile(local_path_str))
-            self.btn_play_pause.setEnabled(True)
-            self.btn_popup_play.setEnabled(True)
-            self.btn_play_pause.setText("▶ 播放")
-            self.progress_slider.setEnabled(True)
-            self.timeline_ticks.set_duration(self.player.duration())
-            self.video_widget.update()
-            self.video_frame.setFocus()
-        except Exception:
-            pass
-
-    def toggle_playback(self):
-        if not MULTIMEDIA_SUPPORTED:
-            return
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
-            self.btn_play_pause.setText("▶ 播放")
-        else:
-            self.player.play()
-            self.btn_play_pause.setText("⏸ 暂停")
-
-    def update_play_timer_label(self, current_ms: int, total_ms: int):
-        if hasattr(self, "download_worker") and self.download_worker.isRunning():
-            return
-
-        def parse_ms_to_str(ms: int) -> str:
-            seconds = (ms // 1000) % 60
-            minutes = (ms // (1000 * 60)) % 60
-            return f"{minutes:02d}:{seconds:02d}"
-        self.time_label.setText(f"{parse_ms_to_str(current_ms)} / {parse_ms_to_str(total_ms)}")
+        parts = []
+        if slots_filled["video"]:
+            parts.append("视频链接")
+        if slots_filled["translation"]:
+            parts.append("翻译区")
+        if slots_filled["timeline"]:
+            parts.append("时间线解析")
+        self._show_status(f"🚀 一键填充完成：{', '.join(parts)} 共 {filled} 个区域。", 4000)
 
     def on_unload(self):
-        if hasattr(self, "popup_window") and self.popup_window:
-            self.popup_window.close()
-        if MULTIMEDIA_SUPPORTED and hasattr(self, "player"):
-            self.player.stop()
+        self.video_panel.stop()
 
-    def start_online_translation(self):
-        text = self.input_a.toPlainText().strip()
-        if not text:
+    def keyPressEvent(self, event):
+        if not self.video_panel.frame.hasFocus():
+            super().keyPressEvent(event)
             return
-        self.btn_online.setEnabled(False)
-        self.btn_online.setText("⏳ 正在翻译中...")
-        self.btn_abort_upper.setEnabled(True)
-        self.engine_label.hide()
-
-        engine_mode = self.get_selected_engine_key(self.combo_mode_upper)
-        self.trans_worker = TranslateWorker(self.engine, text, engine_mode)
-        self.trans_worker.finished.connect(self.on_online_finished)
-        self.trans_worker.error.connect(self.on_online_error)
-        self.trans_worker.start()
-
-    def on_online_finished(self, result_text, engine_label="", elapsed=0.0):
-        self.output_a.setPlainText(result_text)
-        if engine_label and "[双重降级失败]" not in result_text:
-            time_str = f"{elapsed:.1f}s" if elapsed > 0 else ""
-            self.engine_label.setText(f"🔧 {engine_label}  ⏱ {time_str}" if time_str else f"🔧 {engine_label}")
-            self.engine_label.show()
+        key = event.key()
+        if key == Qt.Key.Key_Space:
+            self.video_panel.toggle_playback()
+        elif key == Qt.Key.Key_Left:
+            self.video_panel.seek_offset(-5000)
+        elif key == Qt.Key.Key_Right:
+            self.video_panel.seek_offset(5000)
+        elif key == Qt.Key.Key_Up:
+            self.video_panel.adjust_volume_offset(5)
+        elif key == Qt.Key.Key_Down:
+            self.video_panel.adjust_volume_offset(-5)
         else:
-            self.engine_label.hide()
-        self._reset_upper_ui()
+            super().keyPressEvent(event)
 
-    def on_online_error(self, err):
-        self.output_a.setPlainText(f"[系统级请求故障]: {err}")
-        self._reset_upper_ui()
+    def open_external_video_window(self):
+        self.video_panel.open_external_video_window()
 
-    def start_offline_optimization(self):
-        src_text = self.src_input.toPlainText().strip()
-        if not src_text:
-            return
-        self.btn_offline.setEnabled(False)
-        self.btn_offline.setText("⏳ 正在解析中...")
-        self.btn_abort_lower.setEnabled(True)
-        self.format_engine_label.hide()
+    def restore_video_to_embedded(self):
+        self.video_panel.restore_video_to_embedded()
 
-        engine_mode = self.get_selected_engine_key(self.combo_mode_lower)
-        self.format_worker = FormatWorker(self.engine, source_text=src_text, engine_mode=engine_mode)
-        self.format_worker.finished.connect(self.on_offline_finished)
-        self.format_worker.error.connect(self.on_offline_error)
-        self.format_worker.start()
+    def toggle_playback(self):
+        self.video_panel.toggle_playback()
 
-    def on_offline_finished(self, result_context):
-        self.list_widget.clear()
-        self.detail_display.clear()
-        is_timeline = result_context.metadata.get("is_timeline", False)
+    def seek_offset(self, ms_offset: int):
+        self.video_panel.seek_offset(ms_offset)
 
-        engine_label = result_context.metadata.get("engine_used", "")
-        elapsed = result_context.metadata.get("elapsed", 0.0)
-        if engine_label and is_timeline:
-            time_str = f"{elapsed:.1f}s" if elapsed > 0 else ""
-            self.format_engine_label.setText(f"🔧 {engine_label}  ⏱ {time_str}" if time_str else f"🔧 {engine_label}")
-            self.format_engine_label.show()
-        else:
-            self.format_engine_label.hide()
-        if is_timeline:
-            self.processed_items = result_context.metadata.get("timeline_processed", [])
-            for item in self.processed_items:
-                self.list_widget.addItem(f"{item['step_id']}")
-            if self.processed_items:
-                self.list_widget.setCurrentRow(0)
-        else:
-            self.processed_items = []
-            for idx, para in enumerate(result_context.processed_source_segments):
-                self.list_widget.addItem(f"para_{idx+1}")
-                self.processed_items.append({
-                    "step_id": "N/A", "segment_id": f"para_{idx+1}", "modality": "TEXT",
-                    "timestamp": "N/A", "content": para, "content_local_zh": "（暂不支持）",
-                    "bridge": "无逻辑说明", "bridge_local_zh": "（暂不支持）"
-                })
-            if self.processed_items:
-                self.list_widget.setCurrentRow(0)
-        self._reset_lower_ui()
-
-    def on_offline_error(self, err):
-        self.detail_display.setPlainText(f"[引擎崩溃]: {err}")
-        self._reset_lower_ui()
-
-    def display_item_detail(self, index: int):
-        if index < 0 or index >= len(self.processed_items):
-            self.detail_display.clear()
-            return
-        item = self.processed_items[index]
-
-        c_text = html_mod.escape(item['content'])
-        b_text = html_mod.escape(item['bridge'])
-
-        hl_path = get_app_root() / "highlight.txt"
-        if hl_path.exists():
-            try:
-                with open(hl_path, "r", encoding="utf-8") as f:
-                    keywords = [line.strip() for line in f if line.strip()]
-                for kw in keywords:
-                    pattern = re.compile(rf'\b{re.escape(kw)}\b', re.IGNORECASE)
-                    repl = lambda m: f'<span style="background-color: #15803d; color: #ffffff; padding: 0 4px; border-radius: 4px; font-weight: bold;">{m.group(0)}</span>'
-                    c_text = pattern.sub(repl, c_text)
-                    b_text = pattern.sub(repl, b_text)
-            except Exception:
-                pass
-
-        html_content = f"""
-        <div style="line-height: 1.6; font-size: 13.5px; color: #e4e4e7; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
-            <div style="border-bottom: 1px solid #27272a; padding-bottom: 4px; margin-bottom: 8px;">
-                <span style="font-size: 15px; font-weight: bold; color: #3b82f6;">🎬 节点详情</span>
-                <span style="background-color: #1e3a8a; color: #60a5fa; font-size: 11px; padding: 2px 8px; border-radius: 10px; margin-left: 10px; font-weight: bold;">
-                    {item['step_id']} / {item['segment_id']}
-                </span>
-            </div>
-            <table style="width: 100%; margin-bottom: 8px;">
-                <tr>
-                    <td style="color: #71717a; width: 60px;">⏱️ 时间轴:</td>
-                    <td><a href="jump:{item['timestamp']}" style="color: #10b981; text-decoration: none; font-weight: bold; font-family: monospace;">{item['timestamp']}</a></td>
-                </tr>
-                <tr>
-                    <td style="color: #71717a;">🎙️ 模态:</td>
-                    <td style="color: #f59e0b; font-weight: bold;">{item['modality']}</td>
-                </tr>
-            </table>
-            <div style="background-color: #121214; border: 1px solid #27272a; border-radius: 4px; padding: 10px; margin-bottom: 6px;">
-                <b style="color: #a1a1aa; font-size: 12.5px;">📝 原始描述 Content：</b>
-                <span style="color: #f4f4f5; display: block; margin-top: 4px;">{c_text}</span>
-                <div style="border-top: 1px dashed #27272a; margin-top: 8px; padding-top: 8px;">
-                    <b style="color: #38bdf8; font-size: 11.5px;">🤖 翻译：</b>
-                    <span style="color: #60a5fa; display: block; margin-top: 4px;">{item['content_local_zh']}</span>
-                </div>
-            </div>
-            <div style="background-color: #121214; border: 1px solid #27272a; border-radius: 4px; padding: 10px;">
-                <b style="color: #a1a1aa; font-size: 12.5px;">🔗 逻辑关联与过渡 Bridge：</b>
-                <span style="color: #e4e4e7; font-style: italic; display: block; margin-top: 4px;">{b_text}</span>
-                <div style="border-top: 1px dashed #27272a; margin-top: 8px; padding-top: 8px;">
-                    <b style="color: #38bdf8; font-size: 11.5px;">🤖 翻译：</b>
-                    <span style="color: #60a5fa; display: block; margin-top: 4px;">{item['bridge_local_zh']}</span>
-                </div>
-            </div>
-        </div>
-        """
-        self.detail_display.setHtml(html_content)
+    def adjust_volume_offset(self, vol_offset: int):
+        self.video_panel.adjust_volume_offset(vol_offset)

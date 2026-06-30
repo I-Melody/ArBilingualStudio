@@ -1,12 +1,21 @@
 # -*- coding: utf-8 -*-
+# DEPRECATED: This module is kept for backward compatibility only.
+# New code should use engine.translator_service.TranslatorService and
+# engine.translators.*  modules instead.
+#
+# The OfflineTranslator singleton remains functional but is no longer
+# the recommended API. Migration guide:
+#   from:  OfflineTranslator().translate(text, from_code, to_code)
+#   to:    service.translate_single(text, from_code, to_code, engine_mode)
+#
 import re
 import sys
 import json
 import threading
 import urllib.request
 from pathlib import Path
-from PyQt6.QtCore import QSettings
 from core.paths import get_app_root
+from core import config as app_config
 
 
 def is_translation_error(t: str) -> bool:
@@ -136,13 +145,12 @@ class OfflineTranslator:
             pass
 
     def translate(self, text, from_code: str = "en", to_code: str = "zh", force_engine: str = None):
-        settings = QSettings("BilingualStudioOrg", "BilingualStudioApp")
-        saved_model = settings.value("ollama_model", "")
+        saved_model = app_config.get_ollama_model()
         if saved_model and "未检测到" not in saved_model:
             self.ollama_model = saved_model
 
         try:
-            self.ollama_temp = float(settings.value("ollama_temp", "0.1"))
+            self.ollama_temp = float(app_config.get_ollama_temp())
         except Exception:
             self.ollama_temp = 0.1
 

@@ -1,13 +1,15 @@
 # -*- coding: utf-8 -*-
 import sys
 import importlib
-from PyQt6.QtCore import Qt, QPoint, QRect, QSettings, QDate
+from PyQt6.QtCore import Qt, QPoint, QRect, QDate
+from core import config as app_config
 from PyQt6.QtWidgets import (
     QMainWindow, QTabWidget, QWidget, QVBoxLayout, QStatusBar, QSizeGrip
 )
 from core.paths import get_app_root
 from core.clipboard_monitor import ClipboardMonitor
 from engine.rule_engine import RuleEngine
+from engine.translator_service import TranslatorService
 from .title_bar import CustomTitleBar
 
 
@@ -19,10 +21,10 @@ class MainWindow(QMainWindow):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint |
                             Qt.WindowType.WindowSystemMenuHint)
 
-        self.settings = QSettings("BilingualStudioOrg", "BilingualStudioApp")
         self.setMinimumSize(960, 860)
 
         self.engine = RuleEngine()
+        self.translator_service = TranslatorService()
         self.active_menus = {}
         self.clipboard_monitor = ClipboardMonitor(parent=self)
 
@@ -81,7 +83,8 @@ class MainWindow(QMainWindow):
             module_path = f"menus.{module_name}"
             module = importlib.import_module(module_path)
             widget_class = getattr(module, "MenuWidget")
-            widget_instance = widget_class(parent=self, engine=self.engine)
+            widget_instance = widget_class(parent=self, engine=self.engine,
+                                            translator_service=self.translator_service)
 
             title_map = {
                 "menu1": "双语处理中心",
@@ -120,9 +123,9 @@ class MainWindow(QMainWindow):
             self.resize(1180, 960)
             return
 
-        saved_geom = self.settings.value("geometry")
+        saved_geom = app_config.get_geometry()
         screen_geom = screen.availableGeometry()
-        was_maximized = self.settings.value("maximized", False, type=bool)
+        was_maximized = app_config.get_maximized()
 
         if was_maximized:
             self.setGeometry(screen_geom)
@@ -138,7 +141,7 @@ class MainWindow(QMainWindow):
     def perform_daily_cache_cleanup(self):
         try:
             today_str = QDate.currentDate().toString(Qt.DateFormat.ISODate)
-            last_cleanup = self.settings.value("last_cache_cleanup_date", "")
+            last_cleanup = app_config.get_last_cache_cleanup_date()
 
             cache_dir = get_app_root() / "cache"
 
@@ -153,7 +156,7 @@ class MainWindow(QMainWindow):
                 else:
                     cache_dir.mkdir(parents=True, exist_ok=True)
 
-                self.settings.setValue("last_cache_cleanup_date", today_str)
+                app_config.set_last_cache_cleanup_date(today_str)
             else:
                 cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -161,8 +164,8 @@ class MainWindow(QMainWindow):
             pass
 
     def closeEvent(self, event):
-        self.settings.setValue("geometry", self.saveGeometry())
-        self.settings.setValue("maximized", self._maximized)
+        app_config.set_geometry(self.saveGeometry())
+        app_config.set_maximized(self._maximized)
         super().closeEvent(event)
 
     def _get_resize_edges(self, local_pos: QPoint):

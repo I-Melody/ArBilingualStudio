@@ -74,15 +74,11 @@ class MenuWidget(BaseMenuWidget):
         self.header.setStyleSheet("font-size: 14px; font-weight: bold; color: #f4f4f5;")
         layout.addWidget(self.header)
 
-        mw = self.window()
-        settings = mw.settings if mw and hasattr(mw, "settings") else None
-
-        self.ollama_config = OllamaConfigWidget(settings=settings, parent=self)
+        self.ollama_config = OllamaConfigWidget(parent=self)
         layout.addWidget(self.ollama_config)
 
         self.pdf_viewer = PdfViewerWidget(
             pdf_path=get_app_root() / "rule.pdf",
-            settings=settings,
             parent=self
         )
         layout.addWidget(self.pdf_viewer)

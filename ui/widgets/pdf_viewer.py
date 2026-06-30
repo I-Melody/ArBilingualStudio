@@ -2,6 +2,7 @@
 from pathlib import Path
 from PyQt6.QtCore import Qt, QPointF, QTimer
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+from core import config as app_config
 
 try:
     from PyQt6.QtPdf import QPdfDocument
@@ -15,7 +16,6 @@ class PdfViewerWidget(QWidget):
     def __init__(self, pdf_path: Path, settings=None, parent=None):
         super().__init__(parent)
         self.pdf_path = pdf_path
-        self._settings = settings
         self.current_page = 0
         self.current_cols = 1
 
@@ -105,9 +105,7 @@ class PdfViewerWidget(QWidget):
 
             self.container_layout.addLayout(self.pdf_layout)
 
-            saved_page = 0
-            if self._settings:
-                saved_page = self._settings.value("rule_pdf_current_page", 0, type=int)
+            saved_page = app_config.get_pdf_current_page()
 
             if saved_page >= self.document.pageCount():
                 saved_page = 0
@@ -201,8 +199,7 @@ class PdfViewerWidget(QWidget):
         self._save_progress()
 
     def _save_progress(self):
-        if self._settings:
-            self._settings.setValue("rule_pdf_current_page", self.current_page)
+        app_config.set_pdf_current_page(self.current_page)
 
     def _show_placeholder(self, text: str):
         for i in reversed(range(self.container_layout.count())):
